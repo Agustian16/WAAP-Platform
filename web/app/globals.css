@@ -1,0 +1,187 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  Color system (one source of truth, read by CSS and by JS renderers via getComputedStyle).
+  - Cool graphite ladder, low chroma (hue ~220) so it sits with the steel-teal accent instead of fighting it:
+    chrome (sidebar) < bg (canvas) < surface (panels) < surface-2/3 (hover, pressed). Depth comes from that
+    ladder plus a 1px top highlight on dark panels, not from glow or big shadows. Long SOC shifts, dense tables.
+  - One accent (steel teal): actions, focus, selection, the active nav item only.
+  - Panel surface is deliberately unchanged from the first release: charts sit on it.
+  - Kill chain stage ramp (identity motif): one warm hue, ordinal light->dark (light) / dim->bright (dark).
+    Validated with dataviz validate_palette.js --ordinal on both surfaces.
+  - Status (good/warn/serious/crit) reserved for severity & health, never reused as series.
+  UI colors are RGB channels so Tailwind alpha modifiers work; data colors are hex.
+*/
+@layer base {
+  :root {
+    --chrome: 250 250 251;
+    --bg: 243 244 246;
+    --surface: 255 255 255;
+    --surface-2: 242 243 245;
+    --surface-3: 230 232 236;
+    --input: 255 255 255;
+    --border: 226 228 233;
+    --border-strong: 200 204 211;
+    --fg: 15 17 21;
+    --fg-2: 66 71 80;
+    --muted: 98 104 114;
+    --accent: 11 118 104;
+    --accent-fg: 255 255 255;
+    /* Corazium brand (from brand/corazium-logo.jpg): navy to sky blue; lifted on dark so the mark stays legible. */
+    --logo-a: #5fb6e3; --logo-b: #163d70; --logo-line: #1d4c82; --logo-glow-a: #c9f3ff; --logo-glow-b: #3aa3dc;
+    --brand-ink: 22 61 112;
+    --panel-shadow: 0 1px 2px rgb(15 17 21 / 0.05), 0 0 0 1px rgb(15 17 21 / 0.02);
+    --pop-shadow: 0 12px 32px -8px rgb(15 17 21 / 0.18), 0 2px 6px rgb(15 17 21 / 0.06);
+    --good: 0 110 0;
+    --warn: 138 90 0;
+    --serious: 176 74 32;
+    --crit: 180 35 35;
+
+    --c-good: #0ca30c;
+    --c-warn: #fab219;
+    --c-serious: #ec835a;
+    --c-crit: #d03b3b;
+
+    --stage-0: #b9b8b1; /* weaponization: not observable */
+    --stage-1: #dcab2a;
+    --stage-2: #d8741b;
+    --stage-3: #c94d1f;
+    --stage-4: #b02e2e;
+    --stage-5: #8c1f45;
+    --stage-6: #5a1850;
+
+    --cat-1: #2a78d6;
+    --cat-2: #eb6834;
+    --cat-3: #1baf7a;
+    --cat-4: #eda100;
+    --cat-5: #e87ba4;
+    --cat-6: #008300;
+    --cat-7: #6250d6;
+
+    --seq-1: #cde2fb;
+    --seq-2: #9ec5f4;
+    --seq-3: #6da7ec;
+    --seq-4: #3987e5;
+    --seq-5: #256abf;
+    --seq-6: #184f95;
+    --seq-ink-1: #0b0b0b; --seq-ink-2: #0b0b0b; --seq-ink-3: #0b0b0b; --seq-ink-4: #0b0b0b; --seq-ink-5: #ffffff; --seq-ink-6: #ffffff;
+
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --map-land: #e6e5e0;
+    --map-stroke: #ffffff;
+    color-scheme: light;
+  }
+
+  .dark {
+    --chrome: 11 12 14;
+    --bg: 15 16 19;
+    --surface: 23 24 27;
+    --surface-2: 31 33 38;
+    --surface-3: 41 44 50;
+    --input: 18 19 22;
+    --border: 38 41 47;
+    --border-strong: 58 62 70;
+    --fg: 236 238 241;
+    --fg-2: 178 183 191;
+    --muted: 134 140 150;
+    --accent: 64 196 176;
+    --accent-fg: 8 22 20;
+    --logo-a: #9ad9f7; --logo-b: #3f86c9; --logo-line: #6aa8de; --logo-glow-a: #d4f6ff; --logo-glow-b: #3fb0e6;
+    --brand-ink: 236 238 241;
+    --panel-shadow: inset 0 1px 0 rgb(255 255 255 / 0.035);
+    --pop-shadow: 0 16px 40px -8px rgb(0 0 0 / 0.6), inset 0 1px 0 rgb(255 255 255 / 0.05);
+    --good: 12 163 12;
+    --warn: 250 178 25;
+    --serious: 236 131 90;
+    --crit: 238 96 96;
+
+    --stage-0: #3e4148;
+    --stage-1: #6e3f17;
+    --stage-2: #97471d;
+    --stage-3: #c25026;
+    --stage-4: #e3663b;
+    --stage-5: #f28f68;
+    --stage-6: #f9bb9b;
+
+    --cat-1: #3987e5;
+    --cat-2: #d95926;
+    --cat-3: #199e70;
+    --cat-4: #c98500;
+    --cat-5: #d55181;
+    --cat-6: #008300;
+    --cat-7: #9085e9;
+
+    --seq-1: #1d2c40;
+    --seq-2: #104281;
+    --seq-3: #184f95;
+    --seq-4: #256abf;
+    --seq-5: #3987e5;
+    --seq-6: #86b6ef;
+    --seq-ink-1: #ffffff; --seq-ink-2: #ffffff; --seq-ink-3: #ffffff; --seq-ink-4: #ffffff; --seq-ink-5: #0b0b0b; --seq-ink-6: #0b0b0b;
+
+    --grid: #2c2c2a;
+    --axis: #3e4148;
+    --map-land: #25272c;
+    --map-stroke: #17181b;
+    color-scheme: dark;
+  }
+
+  /* Charts and the kill chain glyph render with the palette they shipped with; the chrome refresh must not move them. */
+  .viz { --surface: 255 255 255; --surface-2: 240 239 236; --surface-3: 230 229 225; --border: 225 224 217; --border-strong: 195 194 183;
+         --fg: 17 17 16; --fg-2: 72 71 67; --muted: 104 103 98; --accent: 11 118 104; --accent-fg: 255 255 255; }
+  .dark .viz { --surface: 23 24 27; --surface-2: 30 32 36; --surface-3: 39 41 46; --border: 42 44 49; --border-strong: 62 65 72;
+               --fg: 236 235 232; --fg-2: 186 184 178; --muted: 145 143 136; --accent: 64 196 176; --accent-fg: 8 22 20; }
+
+  html, body { background: rgb(var(--bg)); color: rgb(var(--fg)); }
+  body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  h1, h2, h3 { letter-spacing: -0.006em; }
+  .font-mono { font-feature-settings: "zero" 1; } /* slashed zero: 0 vs O matters in IPs and hashes */
+
+  a[href], button:not(:disabled), summary, select, label[for], [role="button"], [role="tab"], [role="switch"],
+  [role="menuitem"], [role="option"], input[type="checkbox"], input[type="radio"] { cursor: pointer; }
+  button:disabled, [aria-disabled="true"] { cursor: not-allowed; }
+
+  :focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; border-radius: 4px; }
+
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  ::selection { background: rgb(var(--accent) / 0.3); }
+
+  * { scrollbar-width: thin; scrollbar-color: rgb(var(--border-strong)) transparent; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  }
+
+  @media print {
+    .no-print { display: none !important; }
+    html, body { background: white; color: black; }
+  }
+}
+
+@layer components {
+  .panel { @apply rounded-lg border border-border bg-surface; box-shadow: var(--panel-shadow); }
+  .label-xs { @apply text-[11px] font-medium text-muted; }
+  .data-table { @apply w-full text-left text-[13px]; }
+  .data-table th { @apply h-8 whitespace-nowrap border-b border-border bg-surface-2/50 px-3 text-[11px] font-medium text-muted; }
+  .data-table td { @apply h-10 whitespace-nowrap border-b border-border/70 px-3; }
+  .data-table tbody tr:last-child td { @apply border-b-0; }
+  .data-table tbody tr { @apply transition-colors duration-100; }
+  .data-table tbody tr[data-clickable] { @apply cursor-pointer hover:bg-surface-2/70; }
+  .data-table tbody tr[data-selected="true"] { @apply bg-accent/[0.08] hover:bg-accent/[0.12]; }
+  .data-table tbody tr[data-selected="true"] td:first-child { box-shadow: inset 2px 0 0 rgb(var(--accent)); }
+
+  /* Segmented control: one style for every exclusive toggle (time range, map mode, lanes, editor mode). */
+  .seg { @apply inline-flex shrink-0 gap-0.5 rounded-md border border-border bg-surface-2/70 p-0.5; }
+  .seg-btn { @apply h-7 max-sm:h-9 rounded px-2.5 text-[12px] font-medium text-muted transition-[background-color,color,box-shadow] duration-150 hover:text-fg; }
+  .seg-btn[aria-pressed="true"] { @apply bg-surface text-fg; box-shadow: 0 1px 2px rgb(0 0 0 / 0.12), inset 0 0 0 1px rgb(var(--border-strong) / 0.6); }
+}
+
+/* Live edge flow on the geo map arcs (MOTION 2: shows direction of traffic, stops under reduced motion). */
+@keyframes arc-draw { from { stroke-dashoffset: var(--len); } to { stroke-dashoffset: 0; } }
+@keyframes fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes row-in { from { background: rgb(var(--accent) / 0.16); } to { background: transparent; } }
+.row-new td { animation: row-in 1.6s ease-out; }

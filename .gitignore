@@ -1,0 +1,14 @@
+# local tooling
+.claude/
+.taste-skill/
+anti-slop/
+
+# env
+.env
+.env*.local
+
+# os / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
