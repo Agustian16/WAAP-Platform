@@ -29,10 +29,16 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	agentv1 "github.com/Agustian16/WAAP-Platform/server/gen/agent/v1"
 	"github.com/Agustian16/WAAP-Platform/server/internal/agent"
@@ -53,6 +59,8 @@ type harness struct {
 	api      *httptest.Server
 	grpcAddr string
 	edge     string // base URL of the edge agent
+	core     *agent.Core
+	rdb      *redis.Client
 	tokens   map[model.Role]string
 }
 
@@ -111,6 +119,20 @@ func setup(t *testing.T) *harness {
 	hub := api.NewHub(webOrigin)
 	geo, _ := correlate.NewGeo(mustV(h.pg.GeoOverrides(ctx)), "", "")
 	engine := correlate.NewEngine(h.pg, h.ch, geo, hub.Publish, nil)
+	// With a Redis URL the whole suite runs in cluster mode (and the cluster subtest adds a second instance).
+	if u := os.Getenv("CORAZIUM_TEST_REDIS_URL"); u != "" {
+		opt, err := redis.ParseURL(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.rdb = redis.NewClient(opt)
+		t.Cleanup(func() { h.rdb.Close() })
+		if err := h.rdb.FlushDB(ctx).Err(); err != nil {
+			t.Fatalf("redis: %v", err)
+		}
+		engine.UseLive(correlate.NewRedisLive(h.rdb))
+		hub.UseRedis(ctx, h.rdb)
+	}
 	go engine.Run(ctx)
 	certPEM, keyPEM, err := h.pg.PKI(ctx, agentrpc.GenerateCA)
 	if err != nil {
@@ -123,9 +145,12 @@ func setup(t *testing.T) *harness {
 	}
 	h.grpcAddr = lis.Addr().String()
 	fleet := agentrpc.NewServer(h.pg, h.ch, engine, ca, h.grpcAddr)
+	if h.rdb != nil {
+		fleet.UseRedis(ctx, h.rdb)
+	}
 	go fleet.Serve(ctx, lis, []string{"127.0.0.1"})
 
-	auth, _ := api.NewAuth(ctx, api.AuthConfig{PublicURL: "http://api.test", WebURL: webOrigin, SessionTTL: time.Hour}, h.pg)
+	auth := api.NewAuth(ctx, api.AuthConfig{PublicURL: "http://api.test", WebURL: webOrigin, SessionTTL: time.Hour}, h.pg)
 	h.app = &api.App{PG: h.pg, CH: h.ch, Engine: engine, Hub: hub, Fleet: fleet, Auth: auth, PushWait: 3 * time.Second}
 	h.app.LoadCorrelation(ctx)
 	if err := h.app.EnsureBundle(ctx); err != nil {
@@ -164,13 +189,20 @@ func setup(t *testing.T) *harness {
 		t.Fatalf("enrollment command lacks token or CA pin: %s", enr.Command)
 	}
 	listen := freeAddr(t)
-	ag, err := agent.New(agent.Config{ControlPlane: h.grpcAddr, CAPin: pin, Token: enr.Token, StateDir: t.TempDir(), Listen: listen, Upstream: up.URL,
-		Region: "Test", Lon: 106.8, Lat: -6.2, TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, LogAllowed: true, Heartbeat: 300 * time.Millisecond})
+	h.core, err = agent.NewCore(agent.Config{ControlPlane: h.grpcAddr, CAPin: pin, Token: enr.Token, StateDir: t.TempDir(),
+		Region: "Test", Lon: 106.8, Lat: -6.2, LogAllowed: true, Heartbeat: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.core.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := agent.NewProxy(h.core, listen, up.URL, []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() {
-		if err := ag.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := proxy.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("agent: %v", err)
 		}
 	}()
@@ -687,6 +719,155 @@ func TestControlPlaneEndToEnd(t *testing.T) {
 		}
 		if _, err := h.pg.Exec(ctx, `DELETE FROM audit_trail`); err == nil {
 			t.Fatal("audit trail accepted a DELETE")
+		}
+	})
+
+	t.Run("Envoy ext_proc integration", func(t *testing.T) {
+		addr := freeAddr(t)
+		go agent.NewEnvoy(h.core, addr, nil).Run(ctx)
+		var conn *grpc.ClientConn
+		h.eventually("ext_proc listening", func() bool {
+			c, err := net.Dial("tcp", addr)
+			if err == nil {
+				c.Close()
+			}
+			return err == nil
+		})
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		client := extprocv3.NewExternalProcessorClient(conn)
+		hdrs := func(kv ...string) *corev3.HeaderMap {
+			m := &corev3.HeaderMap{}
+			for i := 0; i+1 < len(kv); i += 2 {
+				m.Headers = append(m.Headers, &corev3.HeaderValue{Key: kv[i], RawValue: []byte(kv[i+1])})
+			}
+			return m
+		}
+		src := func(ip string) map[string]*structpb.Struct {
+			st, _ := structpb.NewStruct(map[string]any{"source.address": ip + ":40000"})
+			return map[string]*structpb.Struct{"envoy.filters.http.ext_proc": st}
+		}
+		// exchange plays one HTTP stream the way Envoy does and returns the status the WAF imposed (0 = none).
+		exchange := func(ip string, reqHdr *corev3.HeaderMap, reqBody string, respHdr *corev3.HeaderMap, respBody string) int {
+			t.Helper()
+			stream, err := client.Process(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.CloseSend()
+			steps := []*extprocv3.ProcessingRequest{{Attributes: src(ip), Request: &extprocv3.ProcessingRequest_RequestHeaders{RequestHeaders: &extprocv3.HttpHeaders{Headers: reqHdr, EndOfStream: reqBody == ""}}}}
+			if reqBody != "" {
+				steps = append(steps, &extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_RequestBody{RequestBody: &extprocv3.HttpBody{Body: []byte(reqBody), EndOfStream: true}}})
+			}
+			steps = append(steps, &extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseHeaders{ResponseHeaders: &extprocv3.HttpHeaders{Headers: respHdr}}},
+				&extprocv3.ProcessingRequest{Request: &extprocv3.ProcessingRequest_ResponseBody{ResponseBody: &extprocv3.HttpBody{Body: []byte(respBody), EndOfStream: true}}})
+			for _, st := range steps {
+				if err := stream.Send(st); err != nil {
+					t.Fatal(err)
+				}
+				res, err := stream.Recv()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if im := res.GetImmediateResponse(); im != nil {
+					return int(im.GetStatus().GetCode())
+				}
+			}
+			return 0
+		}
+		okResp := hdrs(":status", "200", "content-type", "text/html")
+		if code := exchange("198.51.100.77", hdrs(":method", "GET", ":path", "/products/search?q=1%27+UNION+SELECT+password+FROM+users--", ":authority", "shop.domain.com", "user-agent", "Mozilla/5.0"), "", okResp, "<p>ok</p>"); code != 403 {
+			t.Fatalf("SQL injection via ext_proc: status %d", code)
+		}
+		if code := exchange("198.51.100.78", hdrs(":method", "POST", ":path", "/cart", ":authority", "shop.domain.com", "user-agent", "Mozilla/5.0", "content-type", "application/x-www-form-urlencoded"), "item=42&qty=1", okResp, "<p>ok</p>"); code != 0 {
+			t.Fatalf("benign request via ext_proc: status %d", code)
+		}
+		// Outbound inspection: a SQL error page leaking to the client is stopped on the response.
+		leak := "<p>You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1</p>"
+		if code := exchange("198.51.100.79", hdrs(":method", "GET", ":path", "/debug/query?id=7", ":authority", "shop.domain.com", "user-agent", "Mozilla/5.0"), "", okResp, leak); code != 403 {
+			t.Fatalf("data leakage on the response via ext_proc: status %d", code)
+		}
+		h.eventually("ext_proc transactions logged", func() bool {
+			a, b, c := h.logs(store.LogQuery{IP: "198.51.100.77"}), h.logs(store.LogQuery{IP: "198.51.100.78"}), h.logs(store.LogQuery{IP: "198.51.100.79"})
+			return len(a) == 1 && a[0].ActionTaken == "DENY" && len(b) == 1 && b[0].ActionTaken == "ALLOW" && b[0].ResponseStatus == 200 &&
+				len(c) == 1 && c[0].ActionTaken == "DENY" && c[0].Host == "shop.domain.com"
+		})
+	})
+
+	t.Run("cluster: a second control plane instance", func(t *testing.T) {
+		if h.rdb == nil {
+			t.Skip("set CORAZIUM_TEST_REDIS_URL to test cluster mode")
+		}
+		hub2 := api.NewHub(webOrigin)
+		hub2.UseRedis(ctx, h.rdb)
+		geo, _ := correlate.NewGeo(mustV(h.pg.GeoOverrides(ctx)), "", "")
+		engine2 := correlate.NewEngine(h.pg, h.ch, geo, hub2.Publish, nil)
+		engine2.UseLive(correlate.NewRedisLive(h.rdb))
+		certPEM, keyPEM, _ := h.pg.PKI(ctx, agentrpc.GenerateCA)
+		ca, _ := agentrpc.ParseCA(certPEM, keyPEM)
+		fleet2 := agentrpc.NewServer(h.pg, h.ch, engine2, ca, "127.0.0.1:1")
+		fleet2.UseRedis(ctx, h.rdb)
+		app2 := &api.App{PG: h.pg, CH: h.ch, Engine: engine2, Hub: hub2, Fleet: fleet2, Auth: api.NewAuth(ctx, api.AuthConfig{PublicURL: "http://api.test", WebURL: webOrigin, SessionTTL: time.Hour}, h.pg), PushWait: 3 * time.Second}
+		app2.LoadCorrelation(ctx)
+		srv2 := httptest.NewServer(app2.Router())
+		defer srv2.Close()
+
+		// 1. A console connected to instance 2 sees what instance 1 correlates (the node talks to instance 1).
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv2.URL, "http")+"/ws/attacks", &websocket.DialOptions{
+			HTTPHeader: http.Header{"Cookie": {"cz_session=" + h.tokens[model.Analyst]}, "Origin": {webOrigin}}})
+		if err != nil {
+			t.Fatalf("websocket on instance 2: %v", err)
+		}
+		defer ws.CloseNow()
+		for i := 0; i < 3; i++ {
+			h.hit("198.51.100.150", "GET", "cms.domain.com", "/?q=%3Cscript%3Ealert(1)%3C/script%3E", "")
+		}
+		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		_, frame, err := ws.Read(rctx)
+		if err != nil {
+			t.Fatalf("instance 2 got no frame for an event correlated on instance 1: %v", err)
+		}
+		var msg model.StreamMsg
+		_ = json.Unmarshal(frame, &msg)
+		if msg.Campaign.ActorKey != "198.51.100.150" || !msg.IsNewCampaign {
+			t.Fatalf("frame: %+v", msg.Campaign)
+		}
+
+		// 2. The same actor correlated on instance 2 extends instance 1's campaign instead of opening another.
+		engine2.Process(ctx, correlate.Tx{NodeID: "n2", TransactionID: "cluster-tx-1", Host: "cms.domain.com", ClientIP: "198.51.100.150", At: time.Now(),
+			Method: "GET", URI: "/wp-login.php", Action: "DENY", Status: 403, Rules: []correlate.Rule{{ID: 913100, Severity: "CRITICAL"}}})
+		_, frame, err = ws.Read(rctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var msg2 model.StreamMsg
+		_ = json.Unmarshal(frame, &msg2)
+		if msg2.Campaign.ID != msg.Campaign.ID || msg2.Campaign.EventCount != 4 || msg2.IsNewCampaign {
+			t.Fatalf("cross-instance correlation: first %s, then %+v", msg.Campaign.ID, msg2.Campaign)
+		}
+
+		// 3. A deploy started on instance 2 reaches the node connected to instance 1.
+		req, _ := http.NewRequest("POST", srv2.URL+"/api/v1/config/deploy", strings.NewReader("{}"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", webOrigin)
+		req.AddCookie(&http.Cookie{Name: "cz_session", Value: h.tokens[model.Admin]})
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out struct {
+			Version     int64
+			Synced      int
+			Unreachable []string
+		}
+		_ = json.NewDecoder(res.Body).Decode(&out)
+		res.Body.Close()
+		if res.StatusCode != 200 || out.Synced != 1 || len(out.Unreachable) != 0 || h.core.ConfigVersion() != out.Version {
+			t.Fatalf("deploy from instance 2: status %d %+v, node runs v%d", res.StatusCode, out, h.core.ConfigVersion())
 		}
 	})
 

@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -43,33 +45,56 @@ const (
 )
 
 type Auth struct {
-	cfg        AuthConfig
-	pg         *store.PG
+	cfg AuthConfig
+	pg  *store.PG
+
+	mu  sync.Mutex
+	idp *idp // nil until discovery succeeds
+}
+
+type idp struct {
 	oauth      *oauth2.Config
 	verifier   *oidc.IDTokenVerifier
 	endSession string // the IdP's RP-initiated logout endpoint, when it has one
 }
 
-// NewAuth discovers the provider. With no issuer configured it returns an Auth that can only validate
-// existing sessions, and sign-in answers 503 with what to configure.
-func NewAuth(ctx context.Context, cfg AuthConfig, pg *store.PG) (*Auth, error) {
+var errNoIdP = errors.New("no identity provider is configured on the control plane (set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)")
+
+// NewAuth tries provider discovery once. An unreachable IdP does not stop the control plane (node enforcement
+// and existing sessions do not depend on it); discovery is retried on the next sign-in.
+func NewAuth(ctx context.Context, cfg AuthConfig, pg *store.PG) *Auth {
 	a := &Auth{cfg: cfg, pg: pg}
-	if cfg.Issuer == "" {
-		return a, nil
+	if cfg.Issuer != "" {
+		if _, err := a.provider(ctx); err != nil {
+			slog.Warn("identity provider unreachable, sign-in will retry discovery", "issuer", cfg.Issuer, "err", err)
+		}
 	}
-	p, err := oidc.NewProvider(ctx, cfg.Issuer)
+	return a
+}
+
+func (a *Auth) provider(ctx context.Context) (*idp, error) {
+	if a.cfg.Issuer == "" {
+		return nil, errNoIdP
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.idp != nil {
+		return a.idp, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	p, err := oidc.NewProvider(ctx, a.cfg.Issuer)
 	if err != nil {
 		return nil, err
 	}
-	a.verifier = p.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 	var meta struct {
 		EndSession string `json:"end_session_endpoint"`
 	}
 	_ = p.Claims(&meta)
-	a.endSession = meta.EndSession
-	a.oauth = &oauth2.Config{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, Endpoint: p.Endpoint(),
-		RedirectURL: strings.TrimRight(cfg.PublicURL, "/") + "/auth/oidc/callback", Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}
-	return a, nil
+	a.idp = &idp{verifier: p.Verifier(&oidc.Config{ClientID: a.cfg.ClientID}), endSession: meta.EndSession,
+		oauth: &oauth2.Config{ClientID: a.cfg.ClientID, ClientSecret: a.cfg.ClientSecret, Endpoint: p.Endpoint(),
+			RedirectURL: strings.TrimRight(a.cfg.PublicURL, "/") + "/auth/oidc/callback", Scopes: []string{oidc.ScopeOpenID, "profile", "email"}}}
+	return a.idp, nil
 }
 
 func randToken() string {
@@ -90,20 +115,29 @@ func (a *Auth) setCookie(c *gin.Context, name, value, path string, maxAge int) {
 
 func (a *Auth) providers(c *gin.Context) {
 	out := []gin.H{}
-	if a.oauth != nil {
+	if a.cfg.Issuer != "" {
 		out = append(out, gin.H{"id": a.cfg.ProviderID, "name": a.cfg.ProviderName})
 	}
 	c.JSON(200, out)
 }
 
 func (a *Auth) login(c *gin.Context) {
-	if a.oauth == nil || !strings.EqualFold(c.Query("provider"), a.cfg.ProviderID) {
-		c.String(503, "This identity provider is not configured on the control plane (set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET).")
+	if !strings.EqualFold(c.Query("provider"), a.cfg.ProviderID) {
+		c.String(404, "Unknown identity provider")
+		return
+	}
+	p, err := a.provider(c)
+	if errors.Is(err, errNoIdP) {
+		c.String(503, "Sign-in unavailable: %s.", err)
+		return
+	}
+	if err != nil {
+		c.String(503, "The identity provider is not reachable right now. Try again in a moment.")
 		return
 	}
 	state, nonce, verifier := randToken(), randToken(), oauth2.GenerateVerifier()
 	a.setCookie(c, flowCookie, state+"."+nonce+"."+verifier, "/auth", 600)
-	c.Redirect(http.StatusFound, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)))
+	c.Redirect(http.StatusFound, p.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)))
 }
 
 // claimPath walks a dotted path ("realm_access.roles") through decoded token claims.
@@ -156,8 +190,9 @@ var mfaMethods = map[string]bool{"mfa": true, "otp": true, "hwk": true, "swk": t
 
 func (a *Auth) callback(c *gin.Context) {
 	fail := func(status int, msg string) { c.String(status, "Sign-in failed: "+msg) }
-	if a.oauth == nil {
-		fail(503, "no identity provider configured")
+	p, err := a.provider(c)
+	if err != nil {
+		fail(503, "the identity provider is not reachable")
 		return
 	}
 	raw, _ := c.Cookie(flowCookie)
@@ -171,13 +206,13 @@ func (a *Auth) callback(c *gin.Context) {
 		fail(403, e+" "+c.Query("error_description"))
 		return
 	}
-	tok, err := a.oauth.Exchange(c, c.Query("code"), oauth2.VerifierOption(parts[2]))
+	tok, err := p.oauth.Exchange(c, c.Query("code"), oauth2.VerifierOption(parts[2]))
 	if err != nil {
 		fail(502, "code exchange with the identity provider failed")
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
-	idt, err := a.verifier.Verify(c, rawID)
+	idt, err := p.verifier.Verify(c, rawID)
 	if err != nil || idt.Nonce != parts[1] {
 		fail(403, "ID token did not verify")
 		return
@@ -232,8 +267,8 @@ func (a *Auth) logout(c *gin.Context) {
 	a.setCookie(c, sessionCookie, "", "/", -1)
 	// Ending only our session would let the IdP's SSO session sign the next person straight back in.
 	out := gin.H{"ok": true}
-	if a.endSession != "" {
-		out["logoutUrl"] = a.endSession + "?client_id=" + url.QueryEscape(a.cfg.ClientID) + "&post_logout_redirect_uri=" + url.QueryEscape(strings.TrimRight(a.cfg.WebURL, "/")+"/login")
+	if p, err := a.provider(c); err == nil && p.endSession != "" {
+		out["logoutUrl"] = p.endSession + "?client_id=" + url.QueryEscape(a.cfg.ClientID) + "&post_logout_redirect_uri=" + url.QueryEscape(strings.TrimRight(a.cfg.WebURL, "/")+"/login")
 	}
 	c.JSON(200, out)
 }

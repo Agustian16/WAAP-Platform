@@ -16,3 +16,7 @@ Thumbs.db
 # server build output and local dev state
 server/bin/
 server/.run/
+
+# secrets for local runs (MaxMind key, SMTP password)
+server/deploy/local.env
+server/data/

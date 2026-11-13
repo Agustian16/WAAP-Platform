@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/Agustian16/WAAP-Platform/server/internal/correlate"
 	"github.com/Agustian16/WAAP-Platform/server/internal/model"
@@ -237,7 +238,7 @@ func (a *App) patchCampaign(c *gin.Context) {
 		fail(c, err, "Campaign not found")
 		return
 	}
-	a.Engine.Sync(cmp)
+	a.Engine.Sync(c, cmp)
 	for _, x := range audits {
 		a.audit(c, x[0], x[1], "-")
 	}
@@ -246,12 +247,16 @@ func (a *App) patchCampaign(c *gin.Context) {
 
 // ---------- Live stream: WebSocket /ws/attacks (FR-6.6) ----------
 
-// Hub fans correlated events out to every connected console.
+// Hub fans correlated events out to every connected console. With Redis, frames go through a channel so a
+// console sees events correlated by any control plane instance.
 type Hub struct {
 	mu      sync.Mutex
 	clients map[chan []byte]bool
 	origins []string
+	rdb     *redis.Client
 }
+
+const streamChannel = "corazium:stream"
 
 func NewHub(allowedOrigins ...string) *Hub {
 	h := &Hub{clients: map[chan []byte]bool{}}
@@ -263,12 +268,36 @@ func NewHub(allowedOrigins ...string) *Hub {
 	return h
 }
 
+// UseRedis switches the hub to cluster mode.
+func (h *Hub) UseRedis(ctx context.Context, rdb *redis.Client) {
+	h.rdb = rdb
+	sub := rdb.Subscribe(ctx, streamChannel)
+	go func() {
+		defer sub.Close()
+		for m := range sub.Channel() {
+			h.fanout([]byte(m.Payload))
+		}
+	}()
+}
+
 // Publish never blocks the correlation engine: a console that cannot keep up loses frames, not the pipeline.
 func (h *Hub) Publish(m model.StreamMsg) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return
 	}
+	if h.rdb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := h.rdb.Publish(ctx, streamChannel, b).Err(); err != nil {
+			slog.Warn("stream publish", "err", err)
+		}
+		return
+	}
+	h.fanout(b)
+}
+
+func (h *Hub) fanout(b []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for ch := range h.clients {

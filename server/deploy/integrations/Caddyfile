@@ -1,0 +1,23 @@
+# Caddy with the Corazium module in front of the dev upstream. Build: server/integrations/caddy.
+#   CORAZIUM_CA_PIN=... CORAZIUM_TOKEN=... caddy run --config deploy/integrations/Caddyfile
+# The token is needed on the first start only; afterwards the node certificate in state_dir is used.
+{
+	admin off
+	servers {
+		# dev only: the traffic simulator sets X-Forwarded-For from localhost
+		trusted_proxies static 127.0.0.1/32
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+http://:9084 {
+	corazium {
+		control_plane localhost:8443
+		ca_pin {$CORAZIUM_CA_PIN}
+		token {$CORAZIUM_TOKEN}
+		state_dir {$CORAZIUM_STATE_DIR:./corazium-caddy}
+		region Frankfurt
+		location 8.68 50.11
+	}
+	reverse_proxy 127.0.0.1:9000
+}

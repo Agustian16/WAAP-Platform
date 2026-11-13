@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Agustian16/WAAP-Platform/server/internal/model"
@@ -53,21 +54,29 @@ type Sink interface {
 type Engine struct {
 	store   CampaignStore
 	sink    Sink
-	geo     *Geo
+	geo     atomic.Pointer[Geo]
 	publish func(model.StreamMsg)        // WebSocket fan-out
 	notify  func(model.Campaign, string) // escalation alert (FR-6.3)
 
-	mu       sync.Mutex
+	live LiveStore
+
+	mu       sync.RWMutex
 	mapping  []model.KillchainMapping
 	settings map[string]model.CorrelationSettings // by site id
-	live     map[string]*model.Campaign           // by actor key
-	dirty    map[string]bool                      // campaign ids with unsaved counters
+
+	pmu     sync.Mutex
+	pending map[string]model.Campaign // latest unsaved snapshot per campaign id
 }
 
 func NewEngine(store CampaignStore, sink Sink, geo *Geo, publish func(model.StreamMsg), notify func(model.Campaign, string)) *Engine {
-	return &Engine{store: store, sink: sink, geo: geo, publish: publish, notify: notify,
-		settings: map[string]model.CorrelationSettings{}, live: map[string]*model.Campaign{}, dirty: map[string]bool{}}
+	e := &Engine{store: store, sink: sink, publish: publish, notify: notify, live: NewMemoryLive(),
+		settings: map[string]model.CorrelationSettings{}, pending: map[string]model.Campaign{}}
+	e.geo.Store(geo)
+	return e
 }
+
+// SetGeo swaps the GeoIP resolver (after a database update) without stopping correlation.
+func (e *Engine) SetGeo(g *Geo) { e.geo.Store(g) }
 
 // Configure swaps the mapping table and per-site settings (called at start and whenever an Admin edits them).
 func (e *Engine) Configure(mapping []model.KillchainMapping, settings []model.CorrelationSettings) {
@@ -80,24 +89,29 @@ func (e *Engine) Configure(mapping []model.KillchainMapping, settings []model.Co
 	}
 }
 
+// UseLive replaces the in-process live campaign store (RedisLive for several control plane instances).
+func (e *Engine) UseLive(l LiveStore) { e.live = l }
+
 // Restore loads campaigns that may still be extended (after a control-plane restart).
-func (e *Engine) Restore(cs []model.Campaign) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for i := range cs {
-		c := cs[i]
-		if cur, ok := e.live[c.ActorKey]; !ok || cur.LastSeen < c.LastSeen {
-			e.live[c.ActorKey] = &c
+func (e *Engine) Restore(ctx context.Context, cs []model.Campaign) {
+	for _, c := range cs {
+		if err := e.live.Seed(ctx, c); err != nil {
+			slog.Error("restore campaign", "id", c.ID, "err", err)
 		}
 	}
 }
 
 // Sync applies analyst-owned fields after a PATCH so the live copy and the next stream frame stay current.
-func (e *Engine) Sync(c model.Campaign) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if cur, ok := e.live[c.ActorKey]; ok && cur.ID == c.ID {
+func (e *Engine) Sync(ctx context.Context, c model.Campaign) {
+	err := e.live.Update(ctx, c.ActorKey, func(cur *model.Campaign) (*model.Campaign, error) {
+		if cur == nil || cur.ID != c.ID {
+			return nil, nil
+		}
 		cur.Status, cur.Assignee, cur.Notes = c.Status, c.Assignee, c.Notes
+		return cur, nil
+	})
+	if err != nil {
+		slog.Error("sync campaign", "id", c.ID, "err", err)
 	}
 }
 
@@ -117,18 +131,12 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) flush() {
-	e.mu.Lock()
-	var save []model.Campaign
-	for id := range e.dirty {
-		for _, c := range e.live {
-			if c.ID == id {
-				save = append(save, *c)
-			}
-		}
-	}
-	e.dirty = map[string]bool{}
-	e.mu.Unlock()
+	e.pmu.Lock()
+	save := e.pending
+	e.pending = map[string]model.Campaign{}
+	e.pmu.Unlock()
 	for _, c := range save {
+		// SaveCampaign ignores a snapshot older than the stored row, so instances flushing out of order are safe.
 		if err := e.store.SaveCampaign(context.Background(), c); err != nil {
 			slog.Error("save campaign", "id", c.ID, "err", err)
 		}
@@ -218,7 +226,7 @@ func (e *Engine) actorKey(mode, ip, ua string, loc Loc) (key, usedMode, confiden
 
 // Process handles one transaction end to end. It is safe for concurrent use; transactions are correlated in arrival order.
 func (e *Engine) Process(ctx context.Context, tx Tx) {
-	loc := e.geo.Lookup(tx.ClientIP)
+	loc := e.geo.Load().Lookup(tx.ClientIP)
 	log := model.AuditLog{
 		ID: "log_" + tx.TransactionID, Timestamp: tx.At.UTC(), TransactionID: tx.TransactionID, NodeID: tx.NodeID, SiteID: tx.SiteID, Host: tx.Host,
 		ClientIP: tx.ClientIP, ClientPort: tx.ClientPort, CountryCode: loc.CountryCode, ASN: loc.ASN, HTTPMethod: tx.Method, URI: tx.URI,
@@ -239,85 +247,92 @@ func (e *Engine) Process(ctx context.Context, tx Tx) {
 		return
 	}
 
-	e.mu.Lock()
+	e.mu.RLock()
 	rule, category, stage := e.classify(tx.Rules)
+	set, ok := e.settings[tx.SiteID]
+	e.mu.RUnlock()
 	log.Severity = rule.Severity
 	if log.Severity == "" {
 		log.Severity = "NOTICE"
 	}
-	set, ok := e.settings[tx.SiteID]
 	if !ok {
 		set = model.CorrelationSettings{ActorKeyMode: "IP", IdleTimeoutMinutes: 30, MinEventsToOpen: 3}
 	}
 	key, mode, conf := e.actorKey(set.ActorKeyMode, tx.ClientIP, tx.Headers["User-Agent"], loc)
 	ts := tx.At.UnixMilli()
 	path := pathOf(tx.URI)
-
-	c := e.live[key]
-	if c != nil && (c.Status == "CLOSED" || c.Status == "FALSE_POSITIVE" || ts-c.LastSeen >= int64(set.IdleTimeoutMinutes)*60_000) {
-		c = nil // outside the sliding window, or the analyst closed it: this starts a new campaign (FR-6.2)
-	}
-	created := c == nil
-	if created {
-		id, err := e.store.NextCampaignID(ctx, tx.At)
-		if err != nil {
-			e.mu.Unlock()
-			slog.Error("campaign id", "err", err)
-			e.sink.AddLog(log)
-			return
-		}
-		c = &model.Campaign{ID: id, ActorKey: key, ActorMode: mode, SiteID: tx.SiteID, CountryCode: loc.CountryCode, ASN: loc.ASN, ASName: loc.ASName,
-			Geo: [2]float64{loc.Lon, loc.Lat}, CorrelationConfidence: conf, FirstSeen: ts, LastSeen: ts, HighestStage: stage,
-			Stages: []string{}, Categories: []string{}, Targets: []string{}, ShellPaths: []string{}, Notes: []model.Note{}, Status: "ACTIVE"}
-		e.live[key] = c
-	}
-	// C2 (PRD 4.6.2): a later request to a path where a web shell was installed is the actor driving that shell.
-	if stage != "INSTALL" && contains(c.ShellPaths, path) {
-		stage = "C2"
-	}
-	if stage == "INSTALL" && !contains(c.ShellPaths, path) && len(c.ShellPaths) < 50 {
-		c.ShellPaths = append(c.ShellPaths, path)
-	}
 	outcome := Outcome(tx.Action, tx.Status)
 
-	var escalated *string
-	if !created && StageIndex(stage) > StageIndex(c.HighestStage) {
-		s := stage
-		escalated = &s
+	var (
+		snapshot  model.Campaign
+		created   bool
+		opening   bool
+		escalated *string
+	)
+	err := e.live.Update(ctx, key, func(c *model.Campaign) (*model.Campaign, error) {
+		if c != nil && (c.Status == "CLOSED" || c.Status == "FALSE_POSITIVE" || ts-c.LastSeen >= int64(set.IdleTimeoutMinutes)*60_000) {
+			c = nil // outside the sliding window, or the analyst closed it: this starts a new campaign (FR-6.2)
+		}
+		created = c == nil
+		if created {
+			id, err := e.store.NextCampaignID(ctx, tx.At)
+			if err != nil {
+				return nil, fmt.Errorf("campaign id: %w", err)
+			}
+			c = &model.Campaign{ID: id, ActorKey: key, ActorMode: mode, SiteID: tx.SiteID, CountryCode: loc.CountryCode, ASN: loc.ASN, ASName: loc.ASName,
+				Geo: [2]float64{loc.Lon, loc.Lat}, CorrelationConfidence: conf, FirstSeen: ts, LastSeen: ts, HighestStage: stage,
+				Stages: []string{}, Categories: []string{}, Targets: []string{}, ShellPaths: []string{}, Notes: []model.Note{}, Status: "ACTIVE"}
+		}
+		// C2 (PRD 4.6.2): a later request to a path where a web shell was installed is the actor driving that shell.
+		if stage != "INSTALL" && contains(c.ShellPaths, path) {
+			stage = "C2"
+		}
+		if stage == "INSTALL" && !contains(c.ShellPaths, path) && len(c.ShellPaths) < 50 {
+			c.ShellPaths = append(c.ShellPaths, path)
+		}
+		if !created && StageIndex(stage) > StageIndex(c.HighestStage) {
+			s := stage
+			escalated = &s
+		}
+		if StageIndex(stage) > StageIndex(c.HighestStage) {
+			c.HighestStage = stage
+		}
+		c.EventCount++
+		if ts > c.LastSeen {
+			c.LastSeen = ts
+		}
+		if !contains(c.Stages, stage) {
+			c.Stages = append(c.Stages, stage)
+			sort.Slice(c.Stages, func(i, j int) bool { return StageIndex(c.Stages[i]) < StageIndex(c.Stages[j]) })
+		}
+		if !contains(c.Categories, category) {
+			c.Categories = append(c.Categories, category)
+		}
+		if target := tx.Host + path; !contains(c.Targets, target) && len(c.Targets) < 200 {
+			c.Targets = append(c.Targets, target)
+		}
+		if outcome == "POSSIBLY_SUCCESSFUL" {
+			c.PossiblySuccessful++
+		}
+		c.RiskScore = RiskScore(c.HighestStage, len(c.Targets), len(c.Categories), c.PossiblySuccessful, c.EventCount)
+		opening = !c.Opened && c.EventCount >= int64(set.MinEventsToOpen)
+		if opening {
+			c.Opened = true
+		}
+		snapshot = clone(*c)
+		return c, nil
+	})
+	if err != nil {
+		slog.Error("correlate", "actor", key, "err", err)
+		e.sink.AddLog(log)
+		return
 	}
-	if StageIndex(stage) > StageIndex(c.HighestStage) {
-		c.HighestStage = stage
-	}
-	c.EventCount++
-	if ts > c.LastSeen {
-		c.LastSeen = ts
-	}
-	if !contains(c.Stages, stage) {
-		c.Stages = append(c.Stages, stage)
-		sort.Slice(c.Stages, func(i, j int) bool { return StageIndex(c.Stages[i]) < StageIndex(c.Stages[j]) })
-	}
-	if !contains(c.Categories, category) {
-		c.Categories = append(c.Categories, category)
-	}
-	if target := tx.Host + path; !contains(c.Targets, target) && len(c.Targets) < 200 {
-		c.Targets = append(c.Targets, target)
-	}
-	if outcome == "POSSIBLY_SUCCESSFUL" {
-		c.PossiblySuccessful++
-	}
-	c.RiskScore = RiskScore(c.HighestStage, len(c.Targets), len(c.Categories), c.PossiblySuccessful, c.EventCount)
-	opening := !c.Opened && c.EventCount >= int64(set.MinEventsToOpen)
-	if opening {
-		c.Opened = true
-	}
-	snapshot := *c
-	snapshot.Stages = append([]string{}, c.Stages...)
-	snapshot.Targets = append([]string{}, c.Targets...)
 	saveNow := created || opening || escalated != nil
 	if !saveNow {
-		e.dirty[c.ID] = true
+		e.pmu.Lock()
+		e.pending[snapshot.ID] = snapshot
+		e.pmu.Unlock()
 	}
-	e.mu.Unlock()
 
 	if saveNow {
 		if err := e.store.SaveCampaign(ctx, snapshot); err != nil {

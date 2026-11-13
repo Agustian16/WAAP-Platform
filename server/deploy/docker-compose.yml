@@ -3,6 +3,7 @@ name: corazium
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: corazium
       POSTGRES_PASSWORD: corazium-dev
@@ -15,20 +16,40 @@ services:
       retries: 20
   clickhouse:
     image: clickhouse/clickhouse-server:24-alpine
+    restart: unless-stopped
     environment:
       CLICKHOUSE_USER: corazium
       CLICKHOUSE_PASSWORD: corazium-dev
       CLICKHOUSE_DB: corazium
     ports: ["127.0.0.1:59000:9000", "127.0.0.1:58123:8123"]
-    volumes: [chdata:/var/lib/clickhouse]
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./clickhouse/merge_tree.xml:/etc/clickhouse-server/config.d/merge_tree.xml:ro
     ulimits: { nofile: { soft: 262144, hard: 262144 } }
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --user corazium --password corazium-dev -q 'select 1'"]
       interval: 3s
       retries: 20
+  # Shared state when several control plane instances run (REDIS_URL); optional for a single instance.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    ports: ["127.0.0.1:56379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+  # Development mail catcher for escalation emails: SMTP on 51025, inbox at http://localhost:58025.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    ports: ["127.0.0.1:51025:1025", "127.0.0.1:58025:8025"]
   # OIDC identity provider (NFR-2.2). The imported realm has three dev users, each with password + TOTP.
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
+    restart: unless-stopped
     command: ["start-dev", "--import-realm", "--http-port=8081"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
@@ -36,6 +57,25 @@ services:
       KC_HOSTNAME: http://localhost:8081
     ports: ["127.0.0.1:8081:8081"]
     volumes: ["./keycloak:/opt/keycloak/data/import:ro"]
+  # Proxy integrations (docker compose --profile integrations up -d). The edge agents and the app run on the host.
+  envoy:
+    image: envoyproxy/envoy:v1.32-latest
+    restart: unless-stopped
+    profiles: [integrations]
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    ports: ["127.0.0.1:10000:10000"]
+    volumes: ["./integrations/envoy.yaml:/etc/envoy/envoy.yaml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    profiles: [integrations]
+    ports: ["127.0.0.1:8088:8088"]
+    volumes:
+      - ./integrations/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./integrations/spoe.conf:/usr/local/etc/haproxy/spoe.conf:ro
+    extra_hosts: ["host.docker.internal:host-gateway"]
 volumes:
+  redisdata:
   pgdata:
   chdata:

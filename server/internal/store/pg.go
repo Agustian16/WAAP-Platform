@@ -199,6 +199,17 @@ func (p *PG) NodeHeartbeat(ctx context.Context, id string, cpu, mem, rps, latenc
 	return err
 }
 
+type NodeVersion struct {
+	ID      string
+	Version int64
+	Online  bool // heartbeat in the last 20 s
+}
+
+func (p *PG) NodeVersions(ctx context.Context) ([]NodeVersion, error) {
+	rows, err := p.Query(ctx, `SELECT id::text, current_config_version, COALESCE(last_heartbeat > now() - interval '20 seconds', false) FROM nodes`)
+	return collect(rows, err, func(r pgx.Row) (n NodeVersion, err error) { err = r.Scan(&n.ID, &n.Version, &n.Online); return })
+}
+
 func (p *PG) NodeConfigVersion(ctx context.Context, id string, v int64) error {
 	_, err := p.Exec(ctx, `UPDATE nodes SET current_config_version=$2 WHERE id=$1`, id, v)
 	return err
@@ -469,7 +480,8 @@ func (p *PG) SaveCampaign(ctx context.Context, c model.Campaign) error {
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 		ON CONFLICT (id) DO UPDATE SET last_seen=EXCLUDED.last_seen, highest_stage=EXCLUDED.highest_stage, stages=EXCLUDED.stages,
 			categories=EXCLUDED.categories, targets=EXCLUDED.targets, shell_paths=EXCLUDED.shell_paths, risk_score=EXCLUDED.risk_score,
-			event_count=EXCLUDED.event_count, possibly_successful=EXCLUDED.possibly_successful, opened=EXCLUDED.opened, updated_at=now()`,
+			event_count=EXCLUDED.event_count, possibly_successful=EXCLUDED.possibly_successful, opened=EXCLUDED.opened, updated_at=now()
+		WHERE attack_campaigns.event_count <= EXCLUDED.event_count`, // event_count only grows: an older snapshot never wins
 		c.ID, c.ActorKey, c.ActorMode, site, c.CountryCode, c.ASN, c.ASName, c.Geo[0], c.Geo[1], c.CorrelationConfidence,
 		time.UnixMilli(c.FirstSeen), time.UnixMilli(c.LastSeen), c.HighestStage, c.Stages, c.Categories, c.Targets, c.ShellPaths,
 		c.RiskScore, c.EventCount, c.PossiblySuccessful, c.Opened, c.Status)

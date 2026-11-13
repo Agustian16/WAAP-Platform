@@ -4,7 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, CheckCircle, WarningOctagon, Warning, Flask } from "@phosphor-icons/react";
-import { policies, rules } from "@/lib/api";
+import { policies, rules, type FtwReport } from "@/lib/api";
 import { useAsync } from "@/lib/hooks";
 import { buildRule, lint, nextFreeId, parseToBuilder, type BuilderRule, type SandboxResult } from "@/lib/seclang";
 import { Button, ErrorState, Field, Input, Loading, Select, Switch, Textarea } from "@/components/ui";
@@ -190,28 +190,88 @@ export default function RuleEditorPage() {
   );
 }
 
+const SUITE_TEMPLATE = `# Go FTW test suite (schema v2). Every test is sent to a sandbox WAF holding only this rule.
+meta:
+  author: me
+rule_id: 900001
+tests:
+  - test_id: 1
+    stages:
+      - input:
+          uri: "/?user_id=1%20UNION%20SELECT%20@@version"
+          headers: { Host: localhost, User-Agent: ftw, Accept: "*/*" }
+        output:
+          log: { expect_ids: [900001] }
+  - test_id: 2
+    stages:
+      - input:
+          uri: "/?user_id=42"
+          headers: { Host: localhost, User-Agent: ftw, Accept: "*/*" }
+        output:
+          log: { no_expect_ids: [900001] }
+`;
+
 function Sandbox({ code, disabled }: { code: string; disabled: boolean }) {
+  const [mode, setMode] = React.useState<"request" | "suite">("request");
+  const [suite, setSuite] = React.useState(SUITE_TEMPLATE);
+  const [report, setReport] = React.useState<FtwReport | null>(null);
   const [req, setReq] = React.useState({ method: PRESETS[0].method, url: PRESETS[0].url, headers: PRESETS[0].headers, body: PRESETS[0].body });
-  const [res, setRes] = React.useState<(SandboxResult & { engine: string }) | null>(null);
+  const [res, setRes] = React.useState<(SandboxResult & { engine: string; ftw?: FtwReport; ftwTest?: string }) | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const run = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true); setErr(null);
     const headers = Object.fromEntries(req.headers.split("\n").map((l) => l.split(/:(.*)/s).map((x) => x.trim())).filter(([k, v]) => k && v !== undefined));
-    try { setRes((await rules.sandbox(code, { method: req.method, url: req.url, headers, body: req.body })) as SandboxResult & { engine: string }); }
+    try { setRes(await rules.sandbox(code, { method: req.method, url: req.url, headers, body: req.body })); }
+    catch (x) { setErr((x as Error).message); } finally { setBusy(false); }
+  };
+  const runSuite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try { setReport(await rules.ftwSuite(code, suite)); }
     catch (x) { setErr((x as Error).message); } finally { setBusy(false); }
   };
   return (
     <section className="panel h-fit" aria-labelledby="sb-h">
       <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
         <h2 id="sb-h" className="flex items-center gap-2 text-[13px] font-semibold"><Flask size={16} aria-hidden />Test sandbox</h2>
+        <div role="group" aria-label="Sandbox input" className="seg">
+          <button type="button" onClick={() => { setMode("request"); setErr(null); }} aria-pressed={mode === "request"} className="seg-btn">Request</button>
+          <button type="button" onClick={() => { setMode("suite"); setErr(null); }} aria-pressed={mode === "suite"} className="seg-btn">FTW suite</button>
+        </div>
+      </div>
+      {mode === "suite" ? (
+        <>
+          <form onSubmit={runSuite} className="flex flex-col gap-3 p-4">
+            <Field label="FTW tests (YAML)" htmlFor="sb-suite"><Textarea id="sb-suite" rows={14} spellCheck={false} value={suite} onChange={(e) => setSuite(e.target.value)} className="font-mono text-[12px]" /></Field>
+            <p className="text-[11px] text-muted">dest_addr and port are ignored: every test goes to the sandbox.</p>
+            <Button type="submit" variant="primary" disabled={busy || disabled} title={disabled ? "Fix syntax errors first" : undefined}>{busy ? "Running..." : "Run suite"}</Button>
+          </form>
+          <div className="border-t border-border px-4 py-3" aria-live="polite">
+            {err ? <p className="text-[13px] text-crit">{err}</p> : !report ? <p className="text-[12px] text-muted">Runs the suite with Go FTW, the CRS project&rsquo;s WAF test runner, and lists which tests passed.</p> : (
+              <div className="flex flex-col gap-2">
+                <p className={cn("font-mono text-[16px] font-semibold", report.failed.length ? "text-crit" : "text-good")}>{report.passed.length} of {report.run} passed</p>
+                {[...report.failed.map((t) => [t, false] as const), ...report.passed.map((t) => [t, true] as const)].map(([t, ok]) => (
+                  <p key={t} className="flex items-center gap-2 text-[12px]">
+                    {ok ? <CheckCircle size={14} weight="fill" className="text-good" aria-hidden /> : <WarningOctagon size={14} weight="fill" className="text-crit" aria-hidden />}
+                    <span className="font-mono">{t}</span><span className="text-muted">{ok ? "passed" : "failed"}</span>
+                    {report.triggered[t]?.length ? <span className="font-mono text-fg-2">fired {report.triggered[t].join(", ")}</span> : null}
+                  </p>
+                ))}
+                <p className="text-[11px] text-muted">Engine: {report.engine}</p>
+              </div>
+            )}
+          </div>
+        </>
+      ) : (<>
+      <div className="flex justify-end px-4 pt-3">
         <label htmlFor="sb-preset" className="sr-only">Load sample request</label>
         <Select id="sb-preset" className="h-8 text-[12px]" defaultValue="" onChange={(e) => { const p = PRESETS[Number(e.target.value)]; if (p) setReq({ method: p.method, url: p.url, headers: p.headers, body: p.body }); setRes(null); }}>
           <option value="" disabled>Load sample request</option>{PRESETS.map((p, i) => <option key={p.name} value={i}>{p.name}</option>)}
         </Select>
       </div>
-      <form onSubmit={run} className="flex flex-col gap-3 p-4">
+      <form onSubmit={run} className="flex flex-col gap-3 p-4 pt-3">
         <div className="grid grid-cols-[96px_1fr] gap-2">
           <Field label="Method" htmlFor="sb-m"><Select id="sb-m" value={req.method} onChange={(e) => setReq({ ...req, method: e.target.value })}>{["GET", "POST", "PUT", "DELETE"].map((m) => <option key={m}>{m}</option>)}</Select></Field>
           <Field label="Path and query" htmlFor="sb-url"><Input id="sb-url" value={req.url} onChange={(e) => setReq({ ...req, url: e.target.value })} className="font-mono" /></Field>
@@ -231,10 +291,17 @@ function Sandbox({ code, disabled }: { code: string; disabled: boolean }) {
               </div>
             ))}
             {res.skipped.map((x) => <p key={x} className="text-[12px] text-warn">Not evaluated: {x}</p>)}
+            {res.ftw ? (
+              <p className="text-[12px] text-fg-2">
+                Go FTW: {res.ftw.failed.length ? "test failed, not every rule under test fired" : "test passed, the rules under test fired"}.{" "}
+                {res.ftwTest ? <button type="button" className="font-medium text-accent underline-offset-2 hover:underline" onClick={() => { setSuite(res.ftwTest!); setReport(null); setMode("suite"); }}>Open as FTW test</button> : null}
+              </p>
+            ) : null}
             <p className="text-[11px] text-muted">Engine: {res.engine}</p>
           </div>
         )}
       </div>
+      </>)}
     </section>
   );
 }

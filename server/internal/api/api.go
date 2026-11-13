@@ -42,6 +42,8 @@ type App struct {
 	PushWait time.Duration
 	// AllowPrivateFeeds permits threat feed URLs that resolve to private addresses (dev only).
 	AllowPrivateFeeds bool
+	// Leader reports whether this instance runs the background jobs (feed pulls, list expiry). Nil means always.
+	Leader func(context.Context) bool
 	// FeedHTTP overrides the feed HTTP client (tests). Nil means the SSRF-guarded default.
 	FeedHTTP *http.Client
 }
@@ -570,12 +572,24 @@ func (a *App) deleteRule(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true})
 }
 
+// sandbox runs Go FTW (FR-2.4): either one request from the console, turned into an FTW test, or a whole FTW
+// YAML suite.
 func (a *App) sandbox(c *gin.Context) {
 	var in struct {
 		SecLang string             `json:"seclang"`
 		Request waf.SandboxRequest `json:"request"`
+		Suite   string             `json:"suite"`
 	}
 	if !bind(c, &in) {
+		return
+	}
+	if strings.TrimSpace(in.Suite) != "" {
+		rep, err := waf.SandboxFTW(in.SecLang, in.Suite)
+		if err != nil {
+			bad(c, "%s", err.Error())
+			return
+		}
+		c.JSON(200, rep)
 		return
 	}
 	res, err := waf.Sandbox(in.SecLang, in.Request)

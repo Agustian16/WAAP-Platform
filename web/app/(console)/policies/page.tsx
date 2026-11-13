@@ -44,6 +44,7 @@ export default function PoliciesPage() {
   const [deploying, setDeploying] = React.useState(false);
   const [confirmDeploy, setConfirmDeploy] = React.useState(false);
   const [newExc, setNewExc] = React.useState<ExceptionSeed | null>(null);
+  const [addSite, setAddSite] = React.useState(false);
   const site = sites.data?.find((x) => x.id === (siteId ?? sites.data?.[0]?.id));
   React.useEffect(() => { if (site) setDraft(structuredClone(site)); }, [site]);
   const dirty = !!draft && !!site && JSON.stringify(draft) !== JSON.stringify(site);
@@ -80,7 +81,12 @@ export default function PoliciesPage() {
       />
       {!editable ? <p className="mb-4 rounded border border-border bg-surface px-3 py-2 text-[13px] text-fg-2">You are signed in as {s.role}. Policy changes need the Admin role, so controls are read-only.</p> : null}
 
-      {sites.error && !sites.data ? <div className="panel"><ErrorState title="Sites could not be loaded" error={sites.error} onRetry={sites.reload} /></div> : !sites.data || !draft ? <div className="panel"><Loading label="Loading sites" /></div> : (
+      {sites.error && !sites.data ? <div className="panel"><ErrorState title="Sites could not be loaded" error={sites.error} onRetry={sites.reload} /></div> : sites.data?.length === 0 ? (
+        <div className="panel">
+          <Empty title="No sites yet" body={editable ? "Add the first domain the fleet protects. It starts at paranoia level 1 with every CRS category on." : "An Admin has not added any sites yet."}
+            action={editable ? <Button variant="primary" onClick={() => setAddSite(true)}><Plus size={16} aria-hidden />Add site</Button> : undefined} />
+        </div>
+      ) : !sites.data || !draft ? <div className="panel"><Loading label="Loading sites" /></div> : (
         <div className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
           <nav aria-label="Sites" className="panel h-fit p-1.5">
             <ul className="flex gap-1 overflow-x-auto lg:flex-col">
@@ -93,7 +99,13 @@ export default function PoliciesPage() {
                 </li>
               ))}
             </ul>
+            {editable ? (
+              <button onClick={() => setAddSite(true)} className="mt-1 hidden w-full items-center gap-1.5 rounded px-2.5 py-2 text-left text-[13px] font-medium text-accent hover:bg-surface-2 lg:flex">
+                <Plus size={14} aria-hidden />Add site
+              </button>
+            ) : null}
           </nav>
+          {editable ? <Button className="lg:hidden" onClick={() => setAddSite(true)}><Plus size={16} aria-hidden />Add site</Button> : null}
 
           <div className="flex min-w-0 flex-col gap-4">
             <section className="panel" aria-labelledby="pl-h">
@@ -179,6 +191,12 @@ export default function PoliciesPage() {
         </div>
       )}
       <ExceptionDialog open={!!newExc} onOpenChange={(v) => !v && setNewExc(null)} seed={newExc} onDone={() => { exc.reload(); nodes.reload(); }} />
+      <AddSiteDialog open={addSite} onOpenChange={setAddSite} onCreated={(n) => {
+        sites.setData((l) => [...(l ?? []), n]);
+        setSiteId(n.id);
+        nodes.reload();
+        toast({ tone: "ok", title: `${n.domain_name} added`, body: "Deploy the policy so the fleet starts protecting it." });
+      }} />
       <Dialog open={confirmDeploy} onOpenChange={setConfirmDeploy} title="Deploy policy to the fleet" description="Pushes the current policy over the gRPC config stream. Nodes hot-reload without dropping traffic."
         footer={<><Button onClick={() => setConfirmDeploy(false)}>Cancel</Button><Button variant="primary" disabled={deploying} onClick={deploy}>{deploying ? "Deploying..." : "Deploy now"}</Button></>}>
         <ul className="flex flex-col gap-1 text-[13px]">
@@ -188,5 +206,32 @@ export default function PoliciesPage() {
         </ul>
       </Dialog>
     </>
+  );
+}
+
+function AddSiteDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpenChange: (v: boolean) => void; onCreated: (s: Site) => void }) {
+  const [f, setF] = React.useState({ name: "", domain: "" });
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  React.useEffect(() => { if (open) { setF({ name: "", domain: "" }); setErr(null); } }, [open]);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try { onCreated(await policies.createSite({ name: f.name, domain_name: f.domain })); onOpenChange(false); }
+    catch (x) { setErr((x as Error).message); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange} title="Add site" description="A site is one host name the fleet protects, with its own CRS settings and exceptions.">
+      <form onSubmit={submit} className="flex flex-col gap-3">
+        <Field label="Name" htmlFor="site-name"><Input id="site-name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="Partner API" required /></Field>
+        <Field label="Domain" htmlFor="site-domain" hint="Exactly as clients send it in the Host header" error={err}>
+          <Input id="site-domain" value={f.domain} onChange={(e) => setF({ ...f, domain: e.target.value })} placeholder="partners.example.com" className="font-mono" required />
+        </Field>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button type="button" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button type="submit" variant="primary" disabled={busy || !f.name.trim() || !f.domain.trim()}>{busy ? "Adding..." : "Add site"}</Button>
+        </div>
+      </form>
+    </Dialog>
   );
 }

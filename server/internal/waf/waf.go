@@ -3,7 +3,6 @@
 package waf
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -308,57 +307,53 @@ type SandboxResult struct {
 	Matched []SandboxMatch `json:"matched"`
 	Skipped []string       `json:"skipped"`
 	Engine  string         `json:"engine"`
+	// FTW is Go FTW's verdict on the generated test (did every rule under test fire), and FTWTest that test,
+	// ready to paste into a regression suite.
+	FTW     *FTWReport `json:"ftw,omitempty"`
+	FTWTest string     `json:"ftwTest,omitempty"`
 }
 
-// Sandbox evaluates one request against the given rules in an isolated engine and reports which rules matched.
+var allIDsRe = regexp.MustCompile(`\bid:\s*'?(\d+)`)
+
+// Sandbox sends one request through Go FTW to a throwaway WAF holding only the given rules (FR-2.4).
 func Sandbox(seclang string, req SandboxRequest) (SandboxResult, error) {
-	res := SandboxResult{Status: "PASSED", Matched: []SandboxMatch{}, Skipped: []string{}, Engine: EngineVersion() + " (dry run on the control plane)"}
-	engine, err := NewEngine("SecRuleEngine On\nSecRequestBodyAccess On\n" + seclang)
-	if err != nil {
-		return res, fmt.Errorf("SecLang: %s", firstLine(err.Error()))
-	}
+	res := SandboxResult{Status: "PASSED", Matched: []SandboxMatch{}, Skipped: []string{}}
 	u, err := url.Parse(req.URL)
-	if err != nil || !strings.HasPrefix(u.RequestURI(), "/") {
+	if err != nil || !strings.HasPrefix(u.RequestURI(), "/") || u.Host != "" {
 		return res, fmt.Errorf("request URL must be a path such as /api/v1/login?x=1")
 	}
-	method := strings.ToUpper(strings.TrimSpace(req.Method))
-	if method == "" {
-		method = "GET"
+	var ids []uint
+	for _, m := range allIDsRe.FindAllStringSubmatch(seclang, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			ids = append(ids, uint(n))
+		}
 	}
-	r, err := http.NewRequest(method, "http://sandbox.local"+u.RequestURI(), bytes.NewReader([]byte(req.Body)))
+	if len(ids) == 0 {
+		return res, fmt.Errorf("the rules under test need an id")
+	}
+	suite, err := RequestToFTW(ids, req)
 	if err != nil {
-		return res, fmt.Errorf("request: %w", err)
+		return res, err
 	}
-	for k, v := range req.Headers {
-		r.Header.Set(k, v)
+	s, err := startSandboxWAF(seclang)
+	if err != nil {
+		return res, err
 	}
-	if h := r.Header.Get("Host"); h != "" {
-		r.Host = h
+	defer s.Close()
+	rep, err := runFTW(s, []byte(suite))
+	if err != nil {
+		return res, err
 	}
-	if req.Body != "" && r.Header.Get("Content-Length") == "" {
-		r.Header.Set("Content-Length", strconv.Itoa(len(req.Body)))
-	}
-	tx := engine.NewTransaction()
-	defer tx.Close()
-	ProcessRequest(tx, r, "192.0.2.1", 40000, []byte(req.Body))
-	tx.ProcessLogging()
+	res.FTW, res.FTWTest, res.Engine = &rep, suite, rep.Engine
 	seen := map[int]bool{}
-	for _, mr := range tx.MatchedRules() {
-		id := mr.Rule().ID()
-		if id == 0 || seen[id] {
-			continue
+	s.mu.Lock()
+	for _, m := range s.matches {
+		if !seen[m.RuleID] {
+			seen[m.RuleID] = true
+			res.Matched = append(res.Matched, m)
 		}
-		seen[id] = true
-		m := SandboxMatch{RuleID: id, Msg: mr.Message()}
-		if ds := mr.MatchedDatas(); len(ds) > 0 {
-			m.Variable = ds[0].Variable().Name()
-			if k := ds[0].Key(); k != "" {
-				m.Variable += ":" + k
-			}
-			m.Data = ds[0].Value()
-		}
-		res.Matched = append(res.Matched, m)
 	}
+	s.mu.Unlock()
 	if len(res.Matched) > 0 {
 		res.Status = "MATCHED"
 	}

@@ -2,7 +2,7 @@
 // the in-browser mock below answers instead, with the same shapes, so swapping in the real backend is config only.
 import { stringify, parse } from "yaml";
 import * as db from "./mock/data";
-import { buildException, evaluate, lint, nextFreeId, type SandboxRequest } from "./seclang";
+import { buildException, evaluate, lint, nextFreeId, type SandboxRequest, type SandboxResult } from "./seclang";
 import { escalation, mapRule, riskScore, stageIndex, classifyOutcome } from "./killchain";
 import { parseCidr } from "./utils";
 import type {
@@ -12,6 +12,8 @@ import type {
 
 const BASE = process.env.NEXT_PUBLIC_API_URL;
 export const usingMock = !BASE;
+
+export interface FtwReport { run: number; passed: string[]; failed: string[]; skipped: string[]; triggered: Record<string, number[]>; engine: string }
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -91,6 +93,18 @@ export const fleet = {
 // ---------------- Policies & rules (Module 2) ----------------
 export const policies = {
   sites: () => call<Site[]>("GET", "/api/v1/sites", undefined, () => db.sites),
+  createSite: (x: { name: string; domain_name: string }) => call<Site>("POST", "/api/v1/sites", x, () => {
+    requireRole("Admin");
+    const domain = x.domain_name.trim().toLowerCase();
+    if (!x.name.trim() || !/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(domain)) throw new ApiError(422, "A site needs a name and a valid domain name");
+    if (db.sites.some((s) => s.domain_name === domain)) throw new ApiError(409, `${domain} is already a site`);
+    const all = Object.fromEntries(Object.keys(db.sites[0]?.crs_categories ?? {}).map((k) => [k, true]));
+    const site: Site = { id: db.uuid(), name: x.name.trim(), domain_name: domain, paranoia_level: 1, inbound_threshold: 5, outbound_threshold: 4, crs_categories: all, updated_at: new Date().toISOString() };
+    db.sites.push(site);
+    db.correlationSettings.push({ site_id: site.id, actor_key_mode: "IP", idle_timeout_minutes: 30, min_events_to_open: 3 });
+    audit("Site added", domain); markPending();
+    return site;
+  }),
   updateSite: (id: string, patch: Partial<Pick<Site, "paranoia_level" | "inbound_threshold" | "outbound_threshold" | "crs_categories">>) =>
     call<Site>("PATCH", `/api/v1/sites/${id}`, patch, () => {
       requireRole("Admin");
@@ -154,7 +168,11 @@ export const rules = {
     return { ok: true };
   }),
   /** FR-2.4: the control plane runs Go FTW; the mock uses the in-browser preview evaluator. */
-  sandbox: (seclang: string, request: SandboxRequest) => call("POST", "/api/v1/sandbox/ftw", { seclang, request }, () => ({ ...evaluate(seclang, request), engine: "browser preview (mock of Go FTW)" })),
+  sandbox: (seclang: string, request: SandboxRequest) => call<SandboxResult & { engine: string; ftw?: FtwReport; ftwTest?: string }>("POST", "/api/v1/sandbox/ftw", { seclang, request }, () => ({ ...evaluate(seclang, request), engine: "browser preview (mock; Go FTW runs on the control plane)" })),
+  /** Runs a Go FTW YAML suite (schema v2) against the rules. Control plane only: the mock cannot run FTW. */
+  ftwSuite: (seclang: string, suite: string) => call<FtwReport>("POST", "/api/v1/sandbox/ftw", { seclang, suite }, () => {
+    throw new ApiError(501, "FTW suites run on the control plane. Set NEXT_PUBLIC_API_URL to use them.");
+  }),
 };
 
 export const exceptionsApi = {

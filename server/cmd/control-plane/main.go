@@ -3,10 +3,13 @@
 package main
 
 import (
+	"fmt"
+
 	"bufio"
 	"context"
 	"errors"
 	"flag"
+	"github.com/redis/go-redis/v9"
 	"log/slog"
 	"net"
 	"net/http"
@@ -56,10 +59,14 @@ func loadEnvFile(path string) error {
 }
 
 func main() {
-	envFile := flag.String("env-file", "", "optional file of KEY=VALUE settings")
+	var envFiles []string
+	flag.Func("env-file", "file of KEY=VALUE settings (repeatable; earlier files and the real environment win)", func(v string) error {
+		envFiles = append(envFiles, v)
+		return nil
+	})
 	flag.Parse()
-	if *envFile != "" {
-		if err := loadEnvFile(*envFile); err != nil {
+	for _, f := range envFiles {
+		if err := loadEnvFile(f); err != nil {
 			slog.Error("env file", "err", err)
 			os.Exit(2)
 		}
@@ -93,15 +100,12 @@ func run(ctx context.Context) error {
 	if v := os.Getenv("BOOTSTRAP_ADMINS"); v != "" {
 		admins = strings.Split(v, ",")
 	}
-	auth, err := api.NewAuth(ctx, api.AuthConfig{
+	auth := api.NewAuth(ctx, api.AuthConfig{
 		ProviderID: env("OIDC_PROVIDER_ID", "keycloak"), ProviderName: env("OIDC_PROVIDER_NAME", "Keycloak"),
 		Issuer: os.Getenv("OIDC_ISSUER"), ClientID: os.Getenv("OIDC_CLIENT_ID"), ClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
 		RoleClaim: env("OIDC_ROLE_CLAIM", "realm_access.roles"), MFAMode: env("OIDC_MFA_MODE", "claim"),
 		BootstrapAdmins: admins, PublicURL: publicURL, WebURL: webURL, SessionTTL: ttl,
 	}, pg)
-	if err != nil {
-		return errors.Join(errors.New("OIDC discovery failed; is the identity provider at OIDC_ISSUER reachable?"), err)
-	}
 	if os.Getenv("OIDC_ISSUER") == "" {
 		slog.Warn("OIDC_ISSUER is not set: nobody can sign in until an identity provider is configured")
 	}
@@ -110,21 +114,62 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	geo, err := correlate.NewGeo(overrides, os.Getenv("GEOIP_CITY_DB"), os.Getenv("GEOIP_ASN_DB"))
+	cityDB, asnDB := os.Getenv("GEOIP_CITY_DB"), os.Getenv("GEOIP_ASN_DB")
+	var geoUpd *correlate.GeoUpdater
+	if key := os.Getenv("MAXMIND_LICENSE_KEY"); cityDB == "" && key != "" {
+		geoUpd = &correlate.GeoUpdater{Dir: env("GEOIP_DIR", "data/geoip"), AccountID: os.Getenv("MAXMIND_ACCOUNT_ID"), LicenseKey: key, MaxAge: 7 * 24 * time.Hour}
+		c, a, _, err := geoUpd.Ensure(ctx)
+		if err != nil {
+			slog.Warn("GeoLite2 update failed", "err", err)
+		}
+		cityDB, asnDB = c, a
+	}
+	geo, err := correlate.NewGeo(overrides, cityDB, asnDB)
 	if err != nil {
 		return err
 	}
-	if os.Getenv("GEOIP_CITY_DB") == "" {
-		slog.Warn("GEOIP_CITY_DB is not set: addresses outside geoip_overrides resolve to country ZZ")
+	if cityDB == "" {
+		slog.Warn("no GeoIP database (set MAXMIND_LICENSE_KEY or GEOIP_CITY_DB): addresses outside geoip_overrides resolve to country ZZ")
+	} else {
+		slog.Info("GeoIP enrichment on", "city", cityDB, "asn", asnDB)
 	}
 
 	hub := api.NewHub(webURL)
-	engine := correlate.NewEngine(pg, ch, geo, hub.Publish, api.Notifier(os.Getenv("ESCALATION_WEBHOOK_URL")))
+	var mailTo []string
+	for _, a := range strings.Split(os.Getenv("ALERT_EMAIL_TO"), ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			mailTo = append(mailTo, a)
+		}
+	}
+	notify := api.Notifiers(api.Notifier(os.Getenv("ESCALATION_WEBHOOK_URL")), api.EmailNotifier(api.EmailConfig{
+		Addr: os.Getenv("SMTP_ADDR"), Security: env("SMTP_SECURITY", "starttls"), Username: os.Getenv("SMTP_USERNAME"), Password: os.Getenv("SMTP_PASSWORD"),
+		From: os.Getenv("SMTP_FROM"), To: mailTo, WebURL: webURL}))
+	engine := correlate.NewEngine(pg, ch, geo, hub.Publish, notify)
+	var rdb *redis.Client
+	if u := os.Getenv("REDIS_URL"); u != "" {
+		opt, err := redis.ParseURL(u)
+		if err != nil {
+			return fmt.Errorf("REDIS_URL: %w", err)
+		}
+		rdb = redis.NewClient(opt)
+		defer rdb.Close()
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			return fmt.Errorf("redis: %w", err)
+		}
+		engine.UseLive(correlate.NewRedisLive(rdb))
+		hub.UseRedis(ctx, rdb)
+		slog.Info("cluster mode: campaign state, live stream and config pushes shared through Redis")
+	} else {
+		slog.Info("single-instance mode (set REDIS_URL to run several control planes)")
+	}
+	if geoUpd != nil {
+		go refreshGeo(ctx, geoUpd, engine, pg)
+	}
 	live, err := pg.LiveCampaigns(ctx)
 	if err != nil {
 		return err
 	}
-	engine.Restore(live)
+	engine.Restore(ctx, live)
 	go engine.Run(ctx)
 
 	certPEM, keyPEM, err := pg.PKI(ctx, agentrpc.GenerateCA)
@@ -137,12 +182,18 @@ func run(ctx context.Context) error {
 	}
 	grpcAddr := env("GRPC_ADDR", ":8443")
 	fleet := agentrpc.NewServer(pg, ch, engine, ca, env("GRPC_PUBLIC_ADDR", "localhost:8443"))
+	if rdb != nil {
+		fleet.UseRedis(ctx, rdb)
+	}
 
 	app := &api.App{PG: pg, CH: ch, Engine: engine, Hub: hub, Fleet: fleet, Auth: auth, PushWait: time.Second,
 		AllowPrivateFeeds: env("ALLOW_PRIVATE_FEEDS", "") == "true"}
 	app.LoadCorrelation(ctx)
 	if err := app.EnsureBundle(ctx); err != nil {
 		return errors.Join(errors.New("the stored policy does not compile"), err)
+	}
+	if rdb != nil {
+		app.Leader = api.RedisLeader(rdb)
 	}
 	go app.RunJobs(ctx)
 
@@ -168,4 +219,35 @@ func run(ctx context.Context) error {
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return srv.Shutdown(sctx)
+}
+
+// refreshGeo checks once a day for newer GeoLite2 builds and swaps them in without a restart.
+func refreshGeo(ctx context.Context, u *correlate.GeoUpdater, engine *correlate.Engine, pg *store.PG) {
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		city, asn, changed, err := u.Ensure(ctx)
+		if err != nil {
+			slog.Warn("GeoLite2 update failed, keeping the current databases", "err", err)
+		}
+		if !changed {
+			continue
+		}
+		ov, err := pg.GeoOverrides(ctx)
+		if err == nil {
+			var g *correlate.Geo
+			if g, err = correlate.NewGeo(ov, city, asn); err == nil {
+				engine.SetGeo(g)
+				slog.Info("GeoLite2 databases updated")
+			}
+		}
+		if err != nil {
+			slog.Error("GeoLite2 reload failed", "err", err)
+		}
+	}
 }

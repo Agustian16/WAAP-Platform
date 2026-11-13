@@ -5,6 +5,7 @@ package correlate
 import (
 	"math"
 	"net/netip"
+	"os"
 	"sort"
 
 	"github.com/oschwald/maxminddb-golang"
@@ -117,16 +118,26 @@ func NewGeo(ov []store.GeoOverride, cityDB, asnDB string) (*Geo, error) {
 	sort.Slice(g.overrides, func(i, j int) bool { return g.overrides[i].prefix.Bits() > g.overrides[j].prefix.Bits() })
 	var err error
 	if cityDB != "" {
-		if g.city, err = maxminddb.Open(cityDB); err != nil {
+		if g.city, err = openMMDB(cityDB); err != nil {
 			return nil, err
 		}
 	}
 	if asnDB != "" {
-		if g.asn, err = maxminddb.Open(asnDB); err != nil {
+		if g.asn, err = openMMDB(asnDB); err != nil {
 			return nil, err
 		}
 	}
 	return g, nil
+}
+
+// openMMDB reads the whole database into memory instead of memory-mapping it, so the file on disk can be
+// replaced by an update while lookups continue (Windows refuses to replace a mapped file).
+func openMMDB(path string) (*maxminddb.Reader, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return maxminddb.FromBytes(b)
 }
 
 // Lookup never fails: an address nothing knows about resolves to country "ZZ" at 0,0.

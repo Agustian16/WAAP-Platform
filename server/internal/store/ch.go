@@ -136,7 +136,7 @@ func (c *CH) AddMetric(m NodeMetric) { c.mu.Lock(); c.metrics = append(c.metrics
 
 func (c *CH) loop() {
 	defer close(c.done)
-	t := time.NewTicker(400 * time.Millisecond)
+	t := time.NewTicker(time.Second) // each flush is a part per table; fewer, larger inserts merge better
 	defer t.Stop()
 	for {
 		select {

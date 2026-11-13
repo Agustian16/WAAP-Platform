@@ -1,0 +1,7 @@
+<!-- A host crash (power loss, Docker VM restart) can leave many empty, unsynced parts. Above this count ClickHouse
+     refuses to attach the table at all; below it, it moves them to detached/ and carries on. -->
+<clickhouse>
+    <merge_tree>
+        <max_suspicious_broken_parts>1000</max_suspicious_broken_parts>
+    </merge_tree>
+</clickhouse>

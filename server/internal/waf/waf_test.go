@@ -103,7 +103,42 @@ func TestCustomRuleAndLint(t *testing.T) {
 	if err != nil || res.Status != "MATCHED" || len(res.Matched) != 1 || res.Matched[0].RuleID != 900001 || res.Matched[0].Variable != "ARGS:user_id" {
 		t.Fatalf("sandbox: %+v err=%v", res, err)
 	}
-	if res, _ := Sandbox(rule, SandboxRequest{Method: "GET", URL: "/x?user_id=42"}); res.Status != "PASSED" {
+	if res.FTW == nil || len(res.FTW.Passed) != 1 || len(res.FTW.Failed) != 0 {
+		t.Fatalf("Go FTW verdict: %+v", res.FTW)
+	}
+	if res, _ := Sandbox(rule, SandboxRequest{Method: "GET", URL: "/x?user_id=42"}); res.Status != "PASSED" || len(res.FTW.Failed) != 1 {
 		t.Fatalf("sandbox should pass: %+v", res)
+	}
+}
+
+func TestFTWSuite(t *testing.T) {
+	rule := `SecRule ARGS:q "@contains <script" "id:900050,phase:2,deny,status:403,log,msg:'Script tag in q'"`
+	suite := `
+meta: {author: test}
+rule_id: 900050
+tests:
+  - test_id: 1
+    stages:
+      - input: {dest_addr: 192.0.2.1, port: 1, uri: "/s?q=%3Cscript%3Ealert(1)", headers: {Host: localhost, User-Agent: t, Accept: "*/*"}}
+        output: {status: 403, log: {expect_ids: [900050]}}
+  - test_id: 2
+    stages:
+      - input: {dest_addr: 192.0.2.1, port: 1, uri: "/s?q=shoes", headers: {Host: localhost, User-Agent: t, Accept: "*/*"}}
+        output: {log: {no_expect_ids: [900050]}}
+  - test_id: 3
+    stages:
+      - input: {dest_addr: 192.0.2.1, port: 1, uri: "/s?q=shoes", headers: {Host: localhost, User-Agent: t, Accept: "*/*"}}
+        output: {log: {expect_ids: [900050]}}
+`
+	rep, err := SandboxFTW(rule, suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Test 3 is wrong on purpose: FTW must report it as failed. dest_addr/port are overridden to the sandbox.
+	if rep.Run != 3 || len(rep.Passed) != 2 || len(rep.Failed) != 1 {
+		t.Fatalf("suite: %+v", rep)
+	}
+	if _, err := SandboxFTW(rule, "tests: [this is not a test"); err == nil {
+		t.Fatal("broken YAML accepted")
 	}
 }

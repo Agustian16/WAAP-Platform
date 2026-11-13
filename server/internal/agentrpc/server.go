@@ -9,9 +9,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -36,6 +38,8 @@ type Server struct {
 	mu      sync.Mutex
 	conns   map[string]chan *agentv1.ControlMessage // node id -> outbound queue
 	waiters map[int64]chan ack                      // config version -> acks from nodes
+	sent    int64                                   // newest version queued to local nodes
+	rdb     *redis.Client                           // set when running as one of several instances
 }
 
 type ack struct {
@@ -231,26 +235,97 @@ func (s *Server) Connect(stream agentv1.AgentService_ConnectServer) error {
 	}
 }
 
-// Push sends a bundle to every connected node and collects acks for up to wait (NFR-1.2).
+// Push sends a bundle to every node and collects acks for up to wait (NFR-1.2). With Redis, nodes connected to
+// other control plane instances are reached through them, and acks are read from PostgreSQL, where every
+// instance records them.
 func (s *Server) Push(b model.Bundle, wait time.Duration) map[string]bool {
+	if s.rdb == nil {
+		return s.pushLocal(b, wait)
+	}
+	s.sendLocal(b)
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	if err := s.rdb.Publish(ctx, configChannel, strconv.FormatInt(b.Version, 10)).Err(); err != nil {
+		slog.Error("publish config", "err", err)
+	}
+	res := map[string]bool{}
+	for {
+		nodes, err := s.pg.NodeVersions(ctx)
+		if err == nil {
+			all := true
+			for _, n := range nodes {
+				if n.Version >= b.Version {
+					res[n.ID] = true
+				} else if n.Online {
+					all = false
+				}
+			}
+			if all {
+				return res
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return res
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+const configChannel = "corazium:config"
+
+// UseRedis joins a cluster of control plane instances: config pushes announced by any instance reach the nodes
+// connected to this one.
+func (s *Server) UseRedis(ctx context.Context, rdb *redis.Client) {
+	s.rdb = rdb
+	sub := rdb.Subscribe(ctx, configChannel)
+	go func() {
+		defer sub.Close()
+		for m := range sub.Channel() {
+			v, err := strconv.ParseInt(m.Payload, 10, 64)
+			if err != nil {
+				continue
+			}
+			b, err := s.pg.LatestBundle(ctx)
+			if err != nil || b.Version < v {
+				continue
+			}
+			s.sendLocal(b)
+		}
+	}()
+}
+
+// sendLocal queues a bundle to the nodes connected here, once per version.
+func (s *Server) sendLocal(b model.Bundle) int {
 	msg := toProto(b)
 	s.mu.Lock()
-	w := make(chan ack, len(s.conns)+1)
-	s.waiters[b.Version] = w
-	sent := 0
+	defer s.mu.Unlock()
+	if b.Version <= s.sent {
+		return 0
+	}
+	s.sent = b.Version
+	n := 0
 	for _, out := range s.conns {
 		select {
 		case out <- msg:
-			sent++
+			n++
 		default: // queue full: the node is not reading; it will catch up on reconnect
 		}
 	}
+	return n
+}
+
+func (s *Server) pushLocal(b model.Bundle, wait time.Duration) map[string]bool {
+	w := make(chan ack, 256)
+	s.mu.Lock()
+	s.waiters[b.Version] = w
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		delete(s.waiters, b.Version)
 		s.mu.Unlock()
 	}()
+	sent := s.sendLocal(b)
 	res := map[string]bool{}
 	deadline := time.After(wait)
 	for len(res) < sent {

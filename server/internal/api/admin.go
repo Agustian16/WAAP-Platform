@@ -1,10 +1,14 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+
 	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"io"
 	"log/slog"
 	"net"
@@ -299,11 +303,36 @@ func (a *App) fetchFeed(ctx context.Context, f model.ThreatFeed) ([]string, erro
 	return out, nil
 }
 
+// RedisLeader elects one instance to run background jobs. The lease outlives two job ticks, so a dead leader is
+// replaced within about a minute.
+func RedisLeader(rdb *redis.Client) func(context.Context) bool {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	id := hex.EncodeToString(b)
+	extend := redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("EXPIRE", KEYS[1], ARGV[2]) end return 0`)
+	return func(ctx context.Context) bool {
+		ok, err := rdb.SetNX(ctx, "corazium:jobs-leader", id, 75*time.Second).Result()
+		if err == nil && ok {
+			return true
+		}
+		n, err := extend.Run(ctx, rdb, []string{"corazium:jobs-leader"}, id, 75).Int()
+		return err == nil && n == 1
+	}
+}
+
 // RunJobs pulls due feeds and drops expired list entries (block TTLs) until ctx ends.
 func (a *App) RunJobs(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
+		if a.Leader != nil && !a.Leader(ctx) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				continue
+			}
+		}
 		changed := false
 		if n, err := a.PG.DeleteExpiredIPs(ctx); err == nil && n > 0 {
 			changed = true

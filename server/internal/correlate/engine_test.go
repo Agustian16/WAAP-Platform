@@ -148,7 +148,7 @@ func TestCampaignLifecycle(t *testing.T) {
 	e2.Process(ctx, tx("203.0.113.50", t0, "/a", "DENY", 403, recon))
 	closed := f2.msgs[0].Campaign
 	closed.Status = "CLOSED"
-	e2.Sync(closed)
+	e2.Sync(context.Background(), closed)
 	e2.Process(ctx, tx("203.0.113.50", t0.Add(time.Second), "/b", "DENY", 403, recon))
 	if f2.msgs[1].Campaign.ID == closed.ID || !f2.msgs[1].IsNewCampaign {
 		t.Fatal("closed campaign was extended")

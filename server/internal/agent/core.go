@@ -1,10 +1,10 @@
-// Package agent is the Coraza enforcer node (PRD 2.1 item 4): a reverse proxy with the Coraza engine embedded.
-// It receives configuration over the gRPC config stream, hot-swaps engines without dropping traffic, and
-// streams one audit event per transaction back to the control plane.
+// Package agent is the Coraza enforcer node (PRD 2.1 item 4). Core holds what every integration shares: the
+// enrollment and mTLS link to the control plane, config hot-swap without dropping traffic, the cached config,
+// and the audit event stream. The integrations (proxy.go standalone reverse proxy, envoy.go ext_proc, spoa.go
+// HAProxy, and the Caddy module in integrations/caddy) only translate their request model into Tx calls.
 package agent
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -16,13 +16,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httputil"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,7 +26,6 @@ import (
 	"time"
 
 	"github.com/corazawaf/coraza/v3"
-	"github.com/corazawaf/coraza/v3/types"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
 	"google.golang.org/grpc"
@@ -45,19 +40,18 @@ import (
 
 const Version = "0.1.0"
 
+// Config is what every integration (standalone proxy, Caddy, Envoy, HAProxy) needs to reach the control plane.
 type Config struct {
-	ControlPlane   string // host:port of the gRPC listener
-	CAPin          string // SHA-256 of the control plane CA, needed only to enroll
-	Token          string // one-time enrollment token, needed only to enroll
-	StateDir       string // node key, certificate and the cached config live here
-	Listen         string
-	Upstream       string
-	Region         string
-	Lon, Lat       float64
-	AdvertiseIP    string
-	TrustedProxies []netip.Prefix // peers whose X-Forwarded-For is believed
-	LogAllowed     bool           // also report transactions that matched no rule
-	Heartbeat      time.Duration
+	ControlPlane string // host:port of the gRPC listener
+	CAPin        string // SHA-256 of the control plane CA, needed only to enroll
+	Token        string // one-time enrollment token, needed only to enroll
+	StateDir     string // node key, certificate and the cached config live here
+	Proxy        string // integration name shown in Fleet: Standalone, Caddy, Envoy, SPOA
+	Region       string
+	Lon, Lat     float64
+	AdvertiseIP  string
+	LogAllowed   bool // also report transactions that matched no rule
+	Heartbeat    time.Duration
 }
 
 // runtime is one applied configuration. It is swapped atomically, so in-flight requests finish on the engines
@@ -70,10 +64,10 @@ type runtime struct {
 	block, allow []netip.Prefix
 }
 
-type Agent struct {
+// Core is the part of an enforcer node shared by every proxy integration.
+type Core struct {
 	cfg     Config
 	cur     atomic.Pointer[runtime]
-	proxy   *httputil.ReverseProxy
 	events  chan *agentv1.AuditEvent
 	dropped atomic.Uint64
 
@@ -81,6 +75,8 @@ type Agent struct {
 	// lastBeat is when the counters were last reported. It survives reconnects, so traffic counted during a
 	// control plane outage is spread over the whole outage, not over the first interval after it.
 	lastBeat time.Time
+	// unsent is an event whose stream died under it; auditStream runs one at a time (see retry), so no lock.
+	unsent *agentv1.AuditEvent
 }
 
 func build(b model.Bundle) (*runtime, error) {
@@ -107,15 +103,15 @@ func build(b model.Bundle) (*runtime, error) {
 	return rt, nil
 }
 
-func New(cfg Config) (*Agent, error) {
-	up, err := url.Parse(cfg.Upstream)
-	if err != nil || up.Host == "" {
-		return nil, fmt.Errorf("upstream %q is not a URL", cfg.Upstream)
-	}
+// NewCore loads the last applied config, or the baseline CRS policy on a node that has never had one.
+func NewCore(cfg Config) (*Core, error) {
 	if cfg.Heartbeat <= 0 {
 		cfg.Heartbeat = 5 * time.Second
 	}
-	a := &Agent{cfg: cfg, events: make(chan *agentv1.AuditEvent, 8192), lastBeat: time.Now()}
+	if cfg.Proxy == "" {
+		cfg.Proxy = "Standalone"
+	}
+	a := &Core{cfg: cfg, events: make(chan *agentv1.AuditEvent, 8192), lastBeat: time.Now()}
 	// NFR-3.1: start from the last config this node applied; with none cached, from the baseline CRS policy.
 	// Either way the node inspects traffic before, and without, the control plane.
 	b, ok := a.loadCache()
@@ -127,30 +123,19 @@ func New(cfg Config) (*Agent, error) {
 		return nil, err
 	}
 	a.cur.Store(rt)
-	a.proxy = &httputil.ReverseProxy{
-		Rewrite:        func(r *httputil.ProxyRequest) { r.SetURL(up); r.Out.Host = r.In.Host; r.SetXForwarded() },
-		ModifyResponse: a.inspectResponse,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if st := stateOf(r); st != nil && st.interruption != nil {
-				http.Error(w, "Request blocked", status(st.interruption))
-				return
-			}
-			http.Error(w, "Upstream unavailable", http.StatusBadGateway)
-		},
-	}
 	return a, nil
 }
 
-func (a *Agent) cachePath() string { return filepath.Join(a.cfg.StateDir, "bundle.json") }
+func (a *Core) cachePath() string { return filepath.Join(a.cfg.StateDir, "bundle.json") }
 
-func (a *Agent) loadCache() (b model.Bundle, ok bool) {
+func (a *Core) loadCache() (b model.Bundle, ok bool) {
 	raw, err := os.ReadFile(a.cachePath())
 	return b, err == nil && json.Unmarshal(raw, &b) == nil && b.DefaultDirectives != ""
 }
 
 // apply builds engines for a pushed bundle and swaps them in. A bundle that does not build is rejected and the
 // node keeps running what it has.
-func (a *Agent) apply(c *agentv1.ConfigBundle) error {
+func (a *Core) apply(c *agentv1.ConfigBundle) error {
 	b := model.Bundle{Version: c.Version, DefaultDirectives: c.DefaultDirectives, SiteDirectives: c.SiteDirectives, SiteIDs: c.SiteIds, BlockCIDRs: c.BlockCidrs, AllowCIDRs: c.AllowCidrs}
 	rt, err := build(b)
 	if err != nil {
@@ -166,37 +151,6 @@ func (a *Agent) apply(c *agentv1.ConfigBundle) error {
 	return nil
 }
 
-// ---------- HTTP data path ----------
-
-type txState struct {
-	tx           types.Transaction
-	interruption *types.Interruption
-	wafTime      time.Duration
-}
-
-type stateKey struct{}
-
-func stateOf(r *http.Request) *txState { st, _ := r.Context().Value(stateKey{}).(*txState); return st }
-
-func status(it *types.Interruption) int {
-	if it.Status >= 400 {
-		return it.Status
-	}
-	return http.StatusForbidden
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	code int
-}
-
-func (s *statusRecorder) WriteHeader(c int) { s.code = c; s.ResponseWriter.WriteHeader(c) }
-func (s *statusRecorder) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
 func inAny(ps []netip.Prefix, a netip.Addr) bool {
 	// ponytail: linear scan, fine for thousands of entries; switch to a radix tree if feeds grow past ~50k.
 	for _, p := range ps {
@@ -207,142 +161,7 @@ func inAny(ps []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
-// clientAddr returns the peer address, or the nearest untrusted X-Forwarded-For hop when the peer is a trusted proxy.
-func (a *Agent) clientAddr(r *http.Request) (netip.Addr, int) {
-	ap, err := netip.ParseAddrPort(r.RemoteAddr)
-	if err != nil {
-		return netip.Addr{}, 0
-	}
-	peer := ap.Addr().Unmap()
-	if !inAny(a.cfg.TrustedProxies, peer) {
-		return peer, int(ap.Port())
-	}
-	hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	for i := len(hops) - 1; i >= 0; i-- {
-		if ip, err := netip.ParseAddr(strings.TrimSpace(hops[i])); err == nil && !inAny(a.cfg.TrustedProxies, ip.Unmap()) {
-			return ip.Unmap(), 0
-		}
-	}
-	return peer, int(ap.Port())
-}
-
-const maxInspectBody = 1 << 20
-
-func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	a.requests.Add(1)
-	rt := a.cur.Load()
-	host := r.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.ToLower(host)
-	ip, port := a.clientAddr(r)
-	ev := &agentv1.AuditEvent{TimestampMs: start.UnixMilli(), Host: host, SiteId: rt.siteIDs[host], ClientIp: ip.String(), ClientPort: uint32(port),
-		Method: r.Method, Uri: r.URL.RequestURI(), HttpVersion: r.Proto, RequestHeaders: MaskHeaders(r.Header)}
-	rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
-
-	// IP reputation runs before the engine: allowlisted sources skip inspection, blocklisted ones never reach it.
-	if ip.IsValid() && inAny(rt.allow, ip) {
-		a.proxy.ServeHTTP(rec, r)
-		a.emit(ev, "ALLOW", rec.code, 0, nil)
-		return
-	}
-	if ip.IsValid() && inAny(rt.block, ip) {
-		a.blocked.Add(1)
-		http.Error(rec, "Request blocked", http.StatusForbidden)
-		a.emit(ev, "DENY", rec.code, time.Since(start), []*agentv1.MatchedRule{{Id: waf.BlocklistRuleID, Message: "Client IP is on the blocklist",
-			Data: ip.String(), Variable: "REMOTE_ADDR", Severity: "CRITICAL", Tags: []string{"ip-reputation"}}})
-		return
-	}
-
-	engine := rt.sites[host]
-	if engine == nil {
-		engine = rt.def
-	}
-	// Bodies up to the limit are buffered for inspection; anything longer is inspected up to the limit and then
-	// streamed through, so large uploads are not held in memory.
-	head, _ := io.ReadAll(io.LimitReader(r.Body, maxInspectBody))
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
-
-	tx := engine.NewTransaction()
-	defer tx.Close()
-	ev.TransactionId = tx.ID()
-	ev.RequestBody = MaskBody(string(head))
-	st := &txState{tx: tx}
-	st.interruption = waf.ProcessRequest(tx, r, ip.String(), port, head)
-	st.wafTime = time.Since(start)
-	if st.interruption != nil {
-		http.Error(rec, "Request blocked", status(st.interruption))
-	} else {
-		a.proxy.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
-	}
-	t := time.Now()
-	tx.ProcessLogging()
-	st.wafTime += time.Since(t)
-
-	var rules []*agentv1.MatchedRule
-	for _, m := range waf.Matches(tx) {
-		rules = append(rules, &agentv1.MatchedRule{Id: uint32(m.RuleID), Message: m.Message, Data: MaskMatch(m.Variable, m.Data), Variable: m.Variable, Severity: m.Severity, Tags: m.Tags})
-	}
-	action := "ALLOW"
-	switch {
-	case st.interruption != nil:
-		action = "DENY"
-		a.blocked.Add(1)
-	case len(rules) > 0:
-		action = "LOG"
-	}
-	a.emit(ev, action, rec.code, st.wafTime, rules)
-}
-
-// inspectResponse runs the response phases (outbound rules such as data leakage, 95xxxx).
-func (a *Agent) inspectResponse(resp *http.Response) error {
-	st := stateOf(resp.Request)
-	if st == nil {
-		return nil
-	}
-	t := time.Now()
-	defer func() { st.wafTime += time.Since(t) }()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			st.tx.AddResponseHeader(k, v)
-		}
-	}
-	if st.interruption = st.tx.ProcessResponseHeaders(resp.StatusCode, resp.Proto); st.interruption != nil {
-		return errors.New("blocked by response headers rule")
-	}
-	if !st.tx.IsResponseBodyAccessible() || !st.tx.IsResponseBodyProcessable() {
-		return nil
-	}
-	head, err := io.ReadAll(io.LimitReader(resp.Body, maxInspectBody+1))
-	if err != nil {
-		return err
-	}
-	if len(head) > maxInspectBody { // too large to buffer: pass through uninspected
-		resp.Body = struct {
-			io.Reader
-			io.Closer
-		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
-		return nil
-	}
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(head))
-	if it, _, _ := st.tx.WriteResponseBody(head); it != nil {
-		st.interruption = it
-	} else if it, _ := st.tx.ProcessResponseBody(); it != nil {
-		st.interruption = it
-	}
-	if st.interruption != nil {
-		return errors.New("blocked by response body rule")
-	}
-	return nil
-}
-
-func (a *Agent) emit(ev *agentv1.AuditEvent, action string, code int, wafTime time.Duration, rules []*agentv1.MatchedRule) {
+func (a *Core) emit(ev *agentv1.AuditEvent, action string, code int, wafTime time.Duration, rules []*agentv1.MatchedRule) {
 	a.wafNanos.Add(uint64(wafTime))
 	if action == "ALLOW" && !a.cfg.LogAllowed {
 		return
@@ -362,11 +181,11 @@ func (a *Agent) emit(ev *agentv1.AuditEvent, action string, code int, wafTime ti
 
 // ---------- Control plane link ----------
 
-func (a *Agent) file(name string) string { return filepath.Join(a.cfg.StateDir, name) }
+func (a *Core) file(name string) string { return filepath.Join(a.cfg.StateDir, name) }
 
 // enroll runs once: it proves the control plane's identity with the CA pin, sends a CSR with the one-time
 // token, and stores the signed certificate. The private key never leaves the node.
-func (a *Agent) enroll(ctx context.Context) error {
+func (a *Core) enroll(ctx context.Context) error {
 	if a.cfg.Token == "" || a.cfg.CAPin == "" {
 		return errors.New("this node is not enrolled: pass --token and --ca-pin from Fleet > Register node")
 	}
@@ -427,7 +246,7 @@ func (a *Agent) enroll(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) dial() (*grpc.ClientConn, error) {
+func (a *Core) dial() (*grpc.ClientConn, error) {
 	cert, err := tls.LoadX509KeyPair(a.file("node.crt"), a.file("node.key"))
 	if err != nil {
 		return nil, err
@@ -446,7 +265,7 @@ func (a *Agent) dial() (*grpc.ClientConn, error) {
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 10 * time.Second}))
 }
 
-func (a *Agent) advertiseIP() string {
+func (a *Core) advertiseIP() string {
 	if a.cfg.AdvertiseIP != "" {
 		return a.cfg.AdvertiseIP
 	}
@@ -460,7 +279,7 @@ func (a *Agent) advertiseIP() string {
 }
 
 // configStream holds the Connect stream open: hello, then heartbeats up and config bundles down.
-func (a *Agent) configStream(ctx context.Context, client agentv1.AgentServiceClient) error {
+func (a *Core) configStream(ctx context.Context, client agentv1.AgentServiceClient) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := client.Connect(ctx)
@@ -470,7 +289,7 @@ func (a *Agent) configStream(ctx context.Context, client agentv1.AgentServiceCli
 	hostname, _ := os.Hostname()
 	send := make(chan *agentv1.NodeMessage, 4)
 	send <- &agentv1.NodeMessage{Msg: &agentv1.NodeMessage_Hello{Hello: &agentv1.Hello{Hostname: hostname, IpAddress: a.advertiseIP(),
-		Version: "corazium-edge " + Version + " (" + waf.EngineVersion() + ")", CrsVersion: waf.CRSVersion(), Proxy: "Standalone",
+		Version: "corazium-edge " + Version + " (" + waf.EngineVersion() + ")", CrsVersion: waf.CRSVersion(), Proxy: a.cfg.Proxy,
 		Region: a.cfg.Region, Lon: a.cfg.Lon, Lat: a.cfg.Lat, ConfigVersion: a.cur.Load().version}}}
 	errc := make(chan error, 2)
 	go func() {
@@ -528,18 +347,38 @@ func (a *Agent) configStream(ctx context.Context, client agentv1.AgentServiceCli
 	}
 }
 
-func (a *Agent) auditStream(ctx context.Context, client agentv1.AgentServiceClient) error {
+func (a *Core) auditStream(ctx context.Context, client agentv1.AgentServiceClient) error {
 	stream, err := client.AuditStream(ctx)
 	if err != nil {
 		return err
+	}
+	send := func(ev *agentv1.AuditEvent) error {
+		if err := stream.Send(ev); err != nil {
+			a.unsent = ev // the stream was already dead: deliver this one first on the next stream
+			if _, rerr := stream.CloseAndRecv(); rerr != nil {
+				err = rerr // Send only reports EOF; the real cause comes back here
+			}
+			return err
+		}
+		return nil
+	}
+	if ev := a.unsent; ev != nil {
+		a.unsent = nil
+		if err := send(ev); err != nil {
+			return err
+		}
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			_, _ = stream.CloseAndRecv()
 			return ctx.Err()
+		case <-stream.Context().Done():
+			// The connection broke while this node was idle. Without this a quiet node would only find out on its
+			// next event, after the control plane restarted, and lose that event.
+			return context.Cause(stream.Context())
 		case ev := <-a.events:
-			if err := stream.Send(ev); err != nil {
+			if err := send(ev); err != nil {
 				return err
 			}
 		}
@@ -568,8 +407,9 @@ func retry(ctx context.Context, name string, run func() error) {
 	}
 }
 
-// Run enrolls if needed, serves traffic and keeps the control plane link up until ctx ends.
-func (a *Agent) Run(ctx context.Context) error {
+// Start enrolls if needed and opens the control plane link. The streams run until ctx ends and reconnect on
+// their own; traffic inspection never waits for them (NFR-3.1).
+func (a *Core) Start(ctx context.Context) error {
 	if err := os.MkdirAll(a.cfg.StateDir, 0o700); err != nil {
 		return err
 	}
@@ -582,21 +422,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 	client := agentv1.NewAgentServiceClient(conn)
 	go retry(ctx, "config", func() error { return a.configStream(ctx, client) })
 	go retry(ctx, "audit", func() error { return a.auditStream(ctx, client) })
-
-	srv := &http.Server{Addr: a.cfg.Listen, Handler: a, ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-	}()
-	slog.Info("edge agent listening", "addr", a.cfg.Listen, "upstream", a.cfg.Upstream, "config", a.cur.Load().version)
-	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
+	go func() { <-ctx.Done(); conn.Close() }()
 	return nil
 }
+
+// ConfigVersion is the version of the configuration currently enforced.
+func (a *Core) ConfigVersion() int64 { return a.cur.Load().version }
