@@ -12,7 +12,7 @@ import { useSession, useToast } from "./providers";
 import { Button, Menu, MenuContent, MenuItem, MenuLabel, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuTrigger, Switch } from "./ui";
 import { StageTag } from "./atoms";
 import { Logo } from "./brand";
-import { attacks, fleet, subscribeAttackStream, usingMock, mockFailing, setMockFailing } from "@/lib/api";
+import { attacks, auth, fleet, subscribeAttackStream, usingMock, mockFailing, setMockFailing } from "@/lib/api";
 import { stageMeta } from "@/lib/killchain";
 import type { Campaign, EdgeNode, Role, StageKey } from "@/lib/types";
 import { cn, relTime } from "@/lib/utils";
@@ -232,13 +232,13 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
             <p className="text-[13px] font-medium">{s.name}</p>
             <p className="text-[12px] text-muted">{s.email}</p>
           </div>
-          <MenuSeparator />
-          <MenuLabel>Review as role (mock session)</MenuLabel>
-          <MenuRadioGroup value={s.role} onValueChange={(v) => s.setRole(v as Role)}>
-            {(["Admin", "SecOps Analyst", "Auditor"] as Role[]).map((r) => <MenuRadioItem key={r} value={r}>{r}</MenuRadioItem>)}
-          </MenuRadioGroup>
           {usingMock ? (
             <>
+              <MenuSeparator />
+              <MenuLabel>Review as role (mock session)</MenuLabel>
+              <MenuRadioGroup value={s.role} onValueChange={(v) => s.setRole(v as Role)}>
+                {(["Admin", "SecOps Analyst", "Auditor"] as Role[]).map((r) => <MenuRadioItem key={r} value={r}>{r}</MenuRadioItem>)}
+              </MenuRadioGroup>
               <MenuSeparator />
               <div className="flex items-center justify-between gap-3 px-2 py-1.5">
                 <label htmlFor="mock-fail" className="text-[12px] text-fg-2">Simulate API outage</label>
@@ -247,7 +247,11 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
             </>
           ) : null}
           <MenuSeparator />
-          <MenuItem asChild><Link href="/login"><SignOut size={16} aria-hidden />Sign out</Link></MenuItem>
+          {usingMock ? (
+            <MenuItem asChild><Link href="/login"><SignOut size={16} aria-hidden />Sign out</Link></MenuItem>
+          ) : (
+            <MenuItem onSelect={() => auth.logout().then((r) => location.assign(r.logoutUrl ?? "/login"), () => location.assign("/login"))}><SignOut size={16} aria-hidden />Sign out</MenuItem>
+          )}
         </MenuContent>
       </Menu>
     </header>

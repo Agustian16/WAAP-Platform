@@ -11,7 +11,7 @@ npm run build
 
 ## Backend
 
-`NEXT_PUBLIC_API_URL` points the console at the Go control plane. When it is unset, `lib/api.ts` answers every call from an in-browser mock (`lib/mock/data.ts`) with the same shapes, and the top bar shows "Mock API · sample data".
+`NEXT_PUBLIC_API_URL` points the console at the Go control plane in `../server` (see `.env.example`); sign-in, roles and every page then use real data. When it is unset, `lib/api.ts` answers every call from an in-browser mock (`lib/mock/data.ts`) with the same shapes, and the top bar shows "Mock API · sample data".
 
 - REST paths are declared next to each call in `lib/api.ts` (`/api/v1/...`).
 - Live attack events come from `WebSocket /ws/attacks` (mock: a timer that runs the same campaign correlation rules as FR-6.2).

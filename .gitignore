@@ -12,3 +12,7 @@ anti-slop/
 Thumbs.db
 .vscode/
 .idea/
+
+# server build output and local dev state
+server/bin/
+server/.run/

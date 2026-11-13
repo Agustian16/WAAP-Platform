@@ -10,7 +10,7 @@ export interface EdgeNode {
   node_name: string;
   hostname: string;
   ip_address: string;
-  proxy: "Caddy" | "Envoy" | "SPOA";
+  proxy: "Caddy" | "Envoy" | "SPOA" | "Standalone";
   version: string;
   crs_version: string;
   status: NodeStatus;

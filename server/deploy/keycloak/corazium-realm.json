@@ -1,0 +1,131 @@
+{
+  "realm": "corazium",
+  "displayName": "Corazium (development)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "admin"
+      },
+      {
+        "name": "secops-analyst"
+      },
+      {
+        "name": "auditor"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "corazium-console",
+      "name": "Corazium Console",
+      "secret": "corazium-dev-secret",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8080/auth/oidc/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3210/login"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm roles in id token",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "budi",
+      "email": "budi@domain.com",
+      "emailVerified": true,
+      "firstName": "Budi",
+      "lastName": "Santoso",
+      "enabled": true,
+      "realmRoles": [
+        "admin"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "corazium-dev",
+          "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "dev authenticator",
+          "secretData": "{\"value\": \"corazium-dev-totp-01\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
+        }
+      ]
+    },
+    {
+      "username": "ahmad",
+      "email": "ahmad@domain.com",
+      "emailVerified": true,
+      "firstName": "Ahmad",
+      "lastName": "Fauzi",
+      "enabled": true,
+      "realmRoles": [
+        "secops-analyst"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "corazium-dev",
+          "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "dev authenticator",
+          "secretData": "{\"value\": \"corazium-dev-totp-01\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
+        }
+      ]
+    },
+    {
+      "username": "auditor",
+      "email": "auditor@domain.com",
+      "emailVerified": true,
+      "firstName": "External",
+      "lastName": "Auditor",
+      "enabled": true,
+      "realmRoles": [
+        "auditor"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "corazium-dev",
+          "temporary": false
+        },
+        {
+          "type": "otp",
+          "userLabel": "dev authenticator",
+          "secretData": "{\"value\": \"corazium-dev-totp-01\"}",
+          "credentialData": "{\"subType\": \"totp\", \"digits\": 6, \"counter\": 0, \"period\": 30, \"algorithm\": \"HmacSHA1\"}"
+        }
+      ]
+    }
+  ]
+}

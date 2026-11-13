@@ -1,0 +1,98 @@
+syntax = "proto3";
+package corazium.agent.v1;
+option go_package = "github.com/Agustian16/WAAP-Platform/server/gen/agent/v1;agentv1";
+
+// Control plane <-> Coraza edge node (PRD 2.1 item 4). All RPCs except Enroll require a client certificate (mTLS, NFR-2.1).
+service AgentService {
+  // Exchanges a one-time enrollment token and a CSR for a node certificate. Server-authenticated TLS only.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Config stream: the node says hello, heartbeats and acks; the control plane pushes config versions.
+  rpc Connect(stream NodeMessage) returns (stream ControlMessage);
+  // Audit stream: one message per inspected HTTP transaction.
+  rpc AuditStream(stream AuditEvent) returns (AuditAck);
+}
+
+message EnrollRequest {
+  string token = 1;
+  bytes csr_pem = 2;
+  string hostname = 3;
+}
+message EnrollResponse {
+  string node_id = 1;
+  bytes cert_pem = 2;
+  bytes ca_pem = 3;
+}
+
+message NodeMessage {
+  oneof msg {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    ConfigAck ack = 3;
+  }
+}
+message Hello {
+  string hostname = 1;
+  string ip_address = 2;
+  string version = 3;
+  string crs_version = 4;
+  string proxy = 5;
+  string region = 6;
+  double lon = 7;
+  double lat = 8;
+  int64 config_version = 9;
+}
+message Heartbeat {
+  double cpu = 1;          // percent
+  double memory = 2;       // percent
+  uint64 requests = 3;     // since previous heartbeat
+  uint64 blocked = 4;      // since previous heartbeat
+  double latency_ms = 5;   // mean WAF overhead since previous heartbeat
+  double interval_s = 6;
+  int64 config_version = 7;
+}
+message ConfigAck {
+  int64 version = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+message ControlMessage {
+  oneof msg {
+    ConfigBundle config = 1;
+  }
+}
+message ConfigBundle {
+  int64 version = 1;
+  string default_directives = 2;       // policy for hosts without a site
+  map<string, string> site_directives = 3; // host -> SecLang
+  map<string, string> site_ids = 4;    // host -> site id
+  repeated string block_cidrs = 5;
+  repeated string allow_cidrs = 6;
+}
+
+message MatchedRule {
+  uint32 id = 1;
+  string message = 2;
+  string data = 3;
+  string variable = 4;
+  string severity = 5;
+  repeated string tags = 6;
+}
+message AuditEvent {
+  int64 timestamp_ms = 1;
+  string transaction_id = 2;
+  string host = 3;
+  string site_id = 4;
+  string client_ip = 5;
+  uint32 client_port = 6;
+  string method = 7;
+  string uri = 8;
+  string http_version = 9;
+  uint32 response_status = 10;
+  string action = 11;                  // DENY | LOG | ALLOW
+  repeated MatchedRule rules = 12;
+  map<string, string> request_headers = 13; // masked at the node (NFR-2.3)
+  string request_body = 14;            // masked, truncated
+  uint64 latency_us = 15;
+}
+message AuditAck { uint64 received = 1; }

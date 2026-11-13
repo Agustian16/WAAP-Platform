@@ -4,7 +4,8 @@ import * as React from "react";
 import Link from "next/link";
 import { ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, Radar, Tooltip } from "recharts";
 import { Copy, Prohibit, ListMagnifyingGlass, PushPin, PushPinSlash, Play, Stop, DownloadSimple, CaretDown, ArrowsOutSimple, FileText, ShieldSlash } from "@phosphor-icons/react";
-import { attacks } from "@/lib/api";
+import { admin, attacks } from "@/lib/api";
+import { useAsync } from "@/lib/hooks";
 import { CATEGORIES, stageIndex } from "@/lib/killchain";
 import { campaignJson, campaignStix } from "@/lib/export";
 import type { AttackEvent, Campaign, StageKey } from "@/lib/types";
@@ -17,7 +18,6 @@ import { useSession, useToast } from "../providers";
 import { TipBox } from "../charts";
 import type { GraphApi } from "./picto";
 
-const ANALYSTS = ["Ahmad", "Budi", "Deni"];
 
 function Section({ title, children, aside }: { title: string; children: React.ReactNode; aside?: React.ReactNode }) {
   return (
@@ -53,6 +53,8 @@ export function CampaignPanel({ campaign, events, stageFilter, onStageFilter, on
   replaying: boolean; onReplay: () => void; graphApi: React.MutableRefObject<GraphApi | null>;
 }) {
   const s = useSession();
+  const people = useAsync(() => admin.users(), []);
+  const assignable = [...new Set([...(people.data ?? []).filter((u) => u.role !== "Auditor").map((u) => u.name), ...(campaign.assignee ? [campaign.assignee] : [])])];
   const toast = useToast();
   const [block, setBlock] = React.useState(false);
   const [exc, setExc] = React.useState<ExceptionSeed | null>(null);
@@ -156,7 +158,7 @@ export function CampaignPanel({ campaign, events, stageFilter, onStageFilter, on
           <>
             <label htmlFor="assign" className="sr-only">Assignee</label>
             <Select id="assign" className="h-8 text-[12px]" value={c.assignee ?? ""} disabled={busy} onChange={(e) => update({ assignee: e.target.value || null }, e.target.value ? `Assigned to ${e.target.value}` : "Unassigned")}>
-              <option value="">Unassigned</option>{ANALYSTS.map((a) => <option key={a}>{a}</option>)}
+              <option value="">Unassigned</option>{assignable.map((a) => <option key={a}>{a}</option>)}
             </Select>
             <Menu>
               <MenuTrigger asChild><Button size="sm" disabled={busy}>Status<CaretDown size={12} aria-hidden /></Button></MenuTrigger>

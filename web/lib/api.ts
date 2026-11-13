@@ -33,6 +33,7 @@ async function call<T>(method: string, path: string, body: unknown, mock: () => 
       headers: body === undefined ? undefined : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    if (res.status === 401 && typeof location !== "undefined" && !location.pathname.startsWith("/login")) location.assign("/login");
     if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText);
     return res.json();
   }
@@ -52,6 +53,14 @@ function audit(action: string, target: string, target_nodes = "-") {
 
 const markPending = () => db.nodes.forEach((n) => { if (n.status !== "OFFLINE") n.sync_status = "PENDING_UPDATE"; });
 let configVersion = db.CONFIG_VERSION;
+
+// ---------------- Session (NFR-2.2). Real mode only: the mock has no sign-in. ----------------
+export const auth = {
+  me: () => call<User>("GET", "/api/v1/me", undefined, () => { throw new ApiError(401, "mock session"); }),
+  providers: () => call<{ id: string; name: string }[]>("GET", "/auth/providers", undefined, () => []),
+  loginUrl: (providerId: string) => `${BASE}/auth/oidc/login?provider=${encodeURIComponent(providerId)}`,
+  logout: () => call<{ ok: true; logoutUrl?: string }>("POST", "/auth/logout", {}, () => ({ ok: true })),
+};
 
 // ---------------- Fleet (Module 1) ----------------
 export const fleet = {
@@ -459,13 +468,21 @@ function tick() {
 export function subscribeAttackStream(fn: Listener) {
   listeners.add(fn);
   if (BASE && !ws) {
-    ws = new WebSocket(BASE.replace(/^http/, "ws") + "/ws/attacks");
-    ws.onmessage = (e) => { const m = JSON.parse(e.data) as StreamMsg; listeners.forEach((l) => l(m)); };
+    connect();
   } else if (!BASE && !timer) {
     timer = setInterval(tick, 1800);
   }
   return () => {
     listeners.delete(fn);
-    if (!listeners.size) { if (timer) clearInterval(timer); timer = null; ws?.close(); ws = null; }
+    if (!listeners.size) { if (timer) clearInterval(timer); timer = null; if (retry) clearTimeout(retry); retry = null; const w = ws; ws = null; w?.close(); }
   };
+}
+
+// The stream reconnects on its own: a control plane restart must not leave the console silently stale.
+let retry: ReturnType<typeof setTimeout> | null = null;
+function connect() {
+  const sock = new WebSocket(BASE!.replace(/^http/, "ws") + "/ws/attacks");
+  ws = sock;
+  sock.onmessage = (e) => { const m = JSON.parse(e.data) as StreamMsg; listeners.forEach((l) => l(m)); };
+  sock.onclose = () => { if (ws === sock && listeners.size) retry = setTimeout(connect, 3000); };
 }

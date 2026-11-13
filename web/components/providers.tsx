@@ -1,13 +1,15 @@
 "use client";
 import * as React from "react";
+import { usePathname } from "next/navigation";
 import { ThemeProvider } from "next-themes";
 import { X, CheckCircle, WarningOctagon, Info } from "@phosphor-icons/react";
-import { setSession } from "@/lib/api";
+import { auth, setSession, usingMock } from "@/lib/api";
 import type { Role } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // ---------- Session / RBAC (FR-5.1) ----------
-// Real auth is OIDC (NFR-2.2); the role switcher in the user menu exists so each role's UI can be reviewed with mock data.
+// With a backend, the session is whoever signed in through OIDC (NFR-2.2) and the role comes from the control plane.
+// Without one, the role switcher in the user menu lets each role's UI be reviewed with mock data.
 const PEOPLE: Record<Role, { name: string; email: string }> = {
   Admin: { name: "Budi", email: "budi@domain.com" },
   "SecOps Analyst": { name: "Ahmad", email: "ahmad@domain.com" },
@@ -30,13 +32,22 @@ function SessionProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     try { const r = localStorage.getItem("coraza.role") as Role | null; if (r && r in PEOPLE) setRoleState(r); } catch { /* storage blocked */ }
   }, []);
-  const p = PEOPLE[role];
-  setSession({ name: p.name, role });
-  const value = React.useMemo<Session>(() => ({
-    role, ...p,
-    setRole: (r) => { setRoleState(r); try { localStorage.setItem("coraza.role", r); } catch { /* storage blocked */ } },
-    can: (a) => MATRIX[a].includes(role),
-  }), [role, p]);
+  const [me, setMe] = React.useState<{ name: string; email: string; role: Role } | null>(null);
+  const publicPage = usePathname()?.startsWith("/login") ?? false;
+  React.useEffect(() => {
+    // A 401 here sends the browser to /login (see call() in lib/api.ts); the console renders nothing until then.
+    if (!usingMock && !publicPage && !me) auth.me().then(setMe).catch(() => {});
+  }, [publicPage, me]);
+  const p = usingMock ? { ...PEOPLE[role], role } : me;
+  if (p) setSession({ name: p.name, role: p.role });
+  const pRole = p?.role, pName = p?.name, pEmail = p?.email;
+  const value = React.useMemo<Session | null>(() => pRole && pName !== undefined && pEmail !== undefined ? ({
+    role: pRole, name: pName, email: pEmail,
+    setRole: (r) => { if (!usingMock) return; setRoleState(r); try { localStorage.setItem("coraza.role", r); } catch { /* storage blocked */ } },
+    can: (a) => MATRIX[a].includes(pRole),
+  }) : null, [pRole, pName, pEmail]);
+  if (!value && publicPage) return <>{children}</>; // the sign-in page needs no session
+  if (!value) return <div role="status" className="flex min-h-dvh items-center justify-center text-[13px] text-muted">Checking your session...</div>;
   return <SessionCtx.Provider value={value}>{children}</SessionCtx.Provider>;
 }
 
